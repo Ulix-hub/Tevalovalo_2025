@@ -5,12 +5,16 @@ from threading import Lock
 import csv
 
 app = Flask(__name__)
+
 DB_FILE = "codes.db"
 CSV_FILE = "codes.csv"
 lock = Lock()  # Prevent race conditions
 
-# Initialize DB and import codes from CSV
+# ---------------------------
+# Initialize DB and import CSV
+# ---------------------------
 def init_db():
+    # Connect to DB
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         # Create table if not exists
@@ -23,7 +27,7 @@ def init_db():
         """)
         conn.commit()
 
-        # Import CSV codes
+        # Import codes from CSV
         if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as file:
                 reader = csv.DictReader(file)
@@ -31,13 +35,19 @@ def init_db():
                     code = row["Code"].strip()
                     used = row.get("Used", "No").strip()
                     buyer = row.get("BuyerName", "").strip()
+                    # Insert only if code not exists
                     cursor.execute("""
                         INSERT OR IGNORE INTO codes (Code, Used, BuyerName)
                         VALUES (?, ?, ?)
                     """, (code, used, buyer))
             conn.commit()
 
+# Initialize DB **immediately** (works for Render/Gunicorn)
+init_db()
+
+# ---------------------------
 # Validate code endpoint
+# ---------------------------
 @app.route("/validate", methods=["POST"])
 def validate():
     try:
@@ -59,6 +69,7 @@ def validate():
 
                 if row:
                     if row[0].lower() == "no":
+                        # Mark as used
                         cursor.execute(
                             "UPDATE codes SET Used = 'Yes', BuyerName = ? WHERE Code = ?",
                             (buyer_name, user_code)
@@ -73,11 +84,16 @@ def validate():
         print("Error:", e)
         return jsonify({"valid": False, "reason": "server_error"}), 500
 
+# ---------------------------
+# Home
+# ---------------------------
 @app.route("/")
 def home():
     return "Access Code Validator is running 🚀"
 
+# ---------------------------
+# Local dev server
+# ---------------------------
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
