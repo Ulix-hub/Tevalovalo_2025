@@ -6,8 +6,7 @@ from flask import Flask, request, jsonify
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # Published Google Sheet CSV link
-CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSCJvn8DmAWLGevKcvihGNEaZcLPALkhy7BT3rJtH_F_LSaZwIiT5YM52E_sbFV_V2ffX7g--UUElCw/pub?gid=YOUR_SHEET_ID&output=csv
-"
+CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSCJvn8DmAWLGevKcvihGNEaZcLPALkhy7BT3rJtH_F_LSaZwIiT5YM52E_sbFV_V2ffX7g--UUElCw/pub?output=csv"
 
 # Normalize input: uppercase, remove non-alphanumerics
 def norm(s: str) -> str:
@@ -100,3 +99,4 @@ def validate():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
