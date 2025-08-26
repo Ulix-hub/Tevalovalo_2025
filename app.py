@@ -1,3 +1,19 @@
+import sqlite3
+
+DB_FILE = "codes.db"
+
+# Create the table if it doesn't exist
+with sqlite3.connect(DB_FILE) as conn:
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS codes (
+            Code TEXT PRIMARY KEY,
+            Used TEXT,
+            BuyerName TEXT
+        )
+    """)
+    conn.commit()
+
 from flask import Flask, request, jsonify
 import sqlite3
 import os
@@ -58,3 +74,4 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
