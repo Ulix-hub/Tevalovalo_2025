@@ -1,75 +1,58 @@
-import os
-import csv
-import sqlite3
 from flask import Flask, request, jsonify
+import sqlite3
+import os
 from threading import Lock
-
-# -------------------------
-# Config
-# -------------------------
-DB_FILE = "codes.db"
-CSV_FILE = "codes.csv"
+import csv
 
 app = Flask(__name__)
+DB_FILE = "codes.db"
+CSV_FILE = "codes.csv"
 lock = Lock()  # Prevent race conditions
 
-# -------------------------
-# Initialize Database
-# -------------------------
+# Initialize DB and import codes from CSV
 def init_db():
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            # Create table if not exists
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS codes (
-                    Code TEXT PRIMARY KEY,
-                    Used TEXT DEFAULT 'No',
-                    BuyerName TEXT
-                )
-            """)
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        # Create table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS codes (
+                Code TEXT PRIMARY KEY,
+                Used TEXT DEFAULT 'No',
+                BuyerName TEXT
+            )
+        """)
+        conn.commit()
+
+        # Import CSV codes
+        if os.path.exists(CSV_FILE):
+            with open(CSV_FILE, newline="", encoding="utf-8") as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    code = row["Code"].strip()
+                    used = row.get("Used", "No").strip()
+                    buyer = row.get("BuyerName", "").strip()
+                    # Insert only if code not exists
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO codes (Code, Used, BuyerName)
+                        VALUES (?, ?, ?)
+                    """, (code, used, buyer))
             conn.commit()
 
-            # Import CSV only if DB is empty
-            cursor.execute("SELECT COUNT(*) FROM codes")
-            count = cursor.fetchone()[0]
-
-            if count == 0:
-                if os.path.exists(CSV_FILE):
-                    with open(CSV_FILE, newline="", encoding="utf-8") as file:
-                        reader = csv.DictReader(file)
-                        for row in reader:
-                            cursor.execute(
-                                "INSERT OR IGNORE INTO codes (Code, Used, BuyerName) VALUES (?, ?, ?)",
-                                (row["Code"].strip(), row["Used"].strip(), row.get("BuyerName", "").strip())
-                            )
-                    conn.commit()
-                    print(f"Imported {CSV_FILE} into database.")
-                else:
-                    print(f"{CSV_FILE} not found. Skipping import.")
-            else:
-                print("Database already initialized.")
-    except Exception as e:
-        print("Error initializing DB:", e)
-
-# -------------------------
-# Routes
-# -------------------------
-@app.route("/")
-def home():
-    return "Access Code Validator is running 🚀"
-
+# Validate code endpoint
 @app.route("/validate", methods=["POST"])
 def validate():
-    data = request.json
-    user_code = data.get("code", "").strip()
-    buyer_name = data.get("buyer", "").strip()
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"valid": False, "reason": "invalid_json"}), 400
 
-    if not user_code:
-        return jsonify({"valid": False, "reason": "empty_code"}), 400
+        user_code = data.get("code", "").strip()
+        buyer_name = data.get("buyer", "").strip()
 
-    with lock:
-        try:
+        if not user_code:
+            return jsonify({"valid": False, "reason": "empty_code"}), 400
+
+        with lock:
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT Used FROM codes WHERE Code = ?", (user_code,))
@@ -77,7 +60,7 @@ def validate():
 
                 if row:
                     if row[0].lower() == "no":
-                        # Mark code as used
+                        # Mark as used
                         cursor.execute(
                             "UPDATE codes SET Used = 'Yes', BuyerName = ? WHERE Code = ?",
                             (buyer_name, user_code)
@@ -88,13 +71,14 @@ def validate():
                         return jsonify({"valid": False, "reason": "already_used"})
                 else:
                     return jsonify({"valid": False, "reason": "not_found"})
-        except Exception as e:
-            print("Error validating code:", e)
-            return jsonify({"valid": False, "reason": "server_error"}), 500
+    except Exception as e:
+        print("Error:", e)
+        return jsonify({"valid": False, "reason": "server_error"}), 500
 
-# -------------------------
-# Run App
-# -------------------------
+@app.route("/")
+def home():
+    return "Access Code Validator is running 🚀"
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
