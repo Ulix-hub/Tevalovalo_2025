@@ -1,16 +1,18 @@
 from flask import Flask, request, jsonify
 import sqlite3
 import os
-from threading import Lock
 import csv
+from threading import Lock
 
 app = Flask(__name__)
+
 DB_FILE = "codes.db"
 CSV_FILE = "codes.csv"
-lock = Lock()  # Prevent race conditions
+lock = Lock()  # prevent race conditions
 
-# Initialize DB and import codes from CSV
+# Initialize DB and import CSV if needed
 def init_db():
+    db_exists = os.path.exists(DB_FILE)
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         # Create table if not exists
@@ -23,15 +25,14 @@ def init_db():
         """)
         conn.commit()
 
-        # Import CSV codes
-        if os.path.exists(CSV_FILE):
+        # If DB didn't exist before, import CSV
+        if not db_exists and os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as file:
                 reader = csv.DictReader(file)
                 for row in reader:
                     code = row["Code"].strip()
                     used = row.get("Used", "No").strip()
                     buyer = row.get("BuyerName", "").strip()
-                    # Insert only if code not exists
                     cursor.execute("""
                         INSERT OR IGNORE INTO codes (Code, Used, BuyerName)
                         VALUES (?, ?, ?)
@@ -60,7 +61,6 @@ def validate():
 
                 if row:
                     if row[0].lower() == "no":
-                        # Mark as used
                         cursor.execute(
                             "UPDATE codes SET Used = 'Yes', BuyerName = ? WHERE Code = ?",
                             (buyer_name, user_code)
