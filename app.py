@@ -3,21 +3,18 @@ import sqlite3
 import os
 from threading import Lock
 import csv
+import traceback
 
 app = Flask(__name__)
 
 DB_FILE = "codes.db"
 CSV_FILE = "codes.csv"
-lock = Lock()  # Prevent race conditions
+lock = Lock()  # To prevent race conditions
 
-# ---------------------------
-# Initialize DB and import CSV
-# ---------------------------
 def init_db():
-    # Connect to DB
+    """Create table and load codes from CSV."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        # Create table if not exists
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 Code TEXT PRIMARY KEY,
@@ -27,7 +24,7 @@ def init_db():
         """)
         conn.commit()
 
-        # Import codes from CSV
+        # Load codes from CSV into DB
         if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as file:
                 reader = csv.DictReader(file)
@@ -35,19 +32,12 @@ def init_db():
                     code = row["Code"].strip()
                     used = row.get("Used", "No").strip()
                     buyer = row.get("BuyerName", "").strip()
-                    # Insert only if code not exists
                     cursor.execute("""
                         INSERT OR IGNORE INTO codes (Code, Used, BuyerName)
                         VALUES (?, ?, ?)
                     """, (code, used, buyer))
             conn.commit()
 
-# Initialize DB **immediately** (works for Render/Gunicorn)
-init_db()
-
-# ---------------------------
-# Validate code endpoint
-# ---------------------------
 @app.route("/validate", methods=["POST"])
 def validate():
     try:
@@ -69,7 +59,6 @@ def validate():
 
                 if row:
                     if row[0].lower() == "no":
-                        # Mark as used
                         cursor.execute(
                             "UPDATE codes SET Used = 'Yes', BuyerName = ? WHERE Code = ?",
                             (buyer_name, user_code)
@@ -82,18 +71,14 @@ def validate():
                     return jsonify({"valid": False, "reason": "not_found"})
     except Exception as e:
         print("Error:", e)
+        traceback.print_exc()
         return jsonify({"valid": False, "reason": "server_error"}), 500
 
-# ---------------------------
-# Home
-# ---------------------------
 @app.route("/")
 def home():
     return "Access Code Validator is running 🚀"
 
-# ---------------------------
-# Local dev server
-# ---------------------------
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
