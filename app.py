@@ -1,29 +1,26 @@
 from flask import Flask, request, jsonify
-import csv
+import sqlite3
 import os
+from threading import Lock
 
 app = Flask(__name__)
+DB_FILE = "codes.db"
+lock = Lock()  # Prevent race conditions
 
-CODES_FILE = "codes.csv"
+# Initialize DB if not exists
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS codes (
+                Code TEXT PRIMARY KEY,
+                Used TEXT DEFAULT 'No',
+                BuyerName TEXT
+            )
+        """)
+        conn.commit()
 
-# Load codes from CSV
-def load_codes():
-    codes = []
-    if os.path.exists(CODES_FILE):
-        with open(CODES_FILE, mode="r", newline="", encoding="utf-8") as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                codes.append(row)
-    return codes
-
-# Save codes back to CSV
-def save_codes(codes):
-    with open(CODES_FILE, mode="w", newline="", encoding="utf-8") as file:
-        fieldnames = ["Code", "Used", "BuyerName"]
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(codes)
-
+# Validate code
 @app.route("/validate", methods=["POST"])
 def validate():
     data = request.json
@@ -33,26 +30,31 @@ def validate():
     if not user_code:
         return jsonify({"valid": False, "reason": "empty_code"}), 400
 
-    codes = load_codes()
+    with lock:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT Used FROM codes WHERE Code = ?", (user_code,))
+            row = cursor.fetchone()
 
-    for row in codes:
-        if row["Code"].strip() == user_code:
-            if row["Used"].strip().lower() == "no":
-                # Mark as used
-                row["Used"] = "Yes"
-                if buyer_name:
-                    row["BuyerName"] = buyer_name
-                save_codes(codes)
-                return jsonify({"valid": True, "reason": "success"})
+            if row:
+                if row[0].lower() == "no":
+                    # Mark as used
+                    cursor.execute(
+                        "UPDATE codes SET Used = 'Yes', BuyerName = ? WHERE Code = ?",
+                        (buyer_name, user_code)
+                    )
+                    conn.commit()
+                    return jsonify({"valid": True, "reason": "success"})
+                else:
+                    return jsonify({"valid": False, "reason": "already_used"})
             else:
-                return jsonify({"valid": False, "reason": "already_used"})
-    
-    return jsonify({"valid": False, "reason": "not_found"})
+                return jsonify({"valid": False, "reason": "not_found"})
 
 @app.route("/")
 def home():
     return "Access Code Validator is running 🚀"
 
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
