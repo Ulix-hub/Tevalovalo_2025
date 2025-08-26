@@ -1,18 +1,16 @@
 from flask import Flask, request, jsonify
 import sqlite3
 import os
-import csv
 from threading import Lock
+import csv
 
 app = Flask(__name__)
-
 DB_FILE = "codes.db"
 CSV_FILE = "codes.csv"
-lock = Lock()  # prevent race conditions
+lock = Lock()  # Prevent race conditions
 
-# Initialize DB and import CSV if needed
+# Initialize DB and import codes from CSV
 def init_db():
-    db_exists = os.path.exists(DB_FILE)
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         # Create table if not exists
@@ -25,8 +23,8 @@ def init_db():
         """)
         conn.commit()
 
-        # If DB didn't exist before, import CSV
-        if not db_exists and os.path.exists(CSV_FILE):
+        # Import CSV codes
+        if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as file:
                 reader = csv.DictReader(file)
                 for row in reader:
