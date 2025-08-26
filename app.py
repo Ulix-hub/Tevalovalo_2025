@@ -4,7 +4,7 @@ import requests
 from flask import Flask, request, jsonify
 
 # Your published CSV link:
-CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSCJvn8DmAWLGevKcvihGNEaZcLPALkhy7BT3rJtH_F_LSaZwIiT5YM52E_sbFV_V2ffX7g--UUElCw/pub?gid=0&single=true&output=csv"
+CSV_URL = https://docs.google.com/spreadsheets/d/e/2PACX-1vSCJvn8DmAWLGevKcvihGNEaZcLPALkhy7BT3rJtH_F_LSaZwIiT5YM52E_sbFV_V2ffX7g--UUElCw/pub?output=csv
 
 def norm(s: str) -> str:
     # Uppercase, trim, remove non-alphanumerics (tolerates spaces/dashes)
@@ -89,4 +89,5 @@ def validate():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
