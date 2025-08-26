@@ -1,18 +1,19 @@
-import os
-import csv
 import sqlite3
-from threading import Lock
+import csv
+import os
 from flask import Flask, request, jsonify
+from threading import Lock
 
 app = Flask(__name__)
 DB_FILE = "codes.db"
 CSV_FILE = "codes.csv"
 lock = Lock()  # Prevent race conditions
 
-# ---------- Database Initialization ----------
+# Initialize DB and import CSV if table empty
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
+        # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 Code TEXT PRIMARY KEY,
@@ -20,26 +21,22 @@ def init_db():
                 BuyerName TEXT
             )
         """)
-        conn.commit()
+        # Check if table is empty
+        cursor.execute("SELECT COUNT(*) FROM codes")
+        count = cursor.fetchone()[0]
 
-# ---------- Import codes from CSV ----------
-def import_codes_from_csv():
-    if not os.path.exists(CSV_FILE):
-        print(f"{CSV_FILE} not found")
-        return
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        with open(CSV_FILE, newline="", encoding="utf-8") as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                cursor.execute(
-                    "INSERT OR IGNORE INTO codes (Code, Used, BuyerName) VALUES (?, ?, ?)",
-                    (row["Code"].strip(), row["Used"].strip(), row.get("BuyerName", "").strip())
-                )
-        conn.commit()
-    print(f"Codes imported from {CSV_FILE} ✅")
+        if count == 0 and os.path.exists(CSV_FILE):
+            with open(CSV_FILE, newline="", encoding="utf-8") as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO codes (Code, Used, BuyerName) VALUES (?, ?, ?)",
+                        (row["Code"].strip(), row["Used"].strip(), row.get("BuyerName", "").strip())
+                    )
+            conn.commit()
+            print(f"Imported {CSV_FILE} into database.")
 
-# ---------- Validate code endpoint ----------
+# Validate code
 @app.route("/validate", methods=["POST"])
 def validate():
     data = request.json
@@ -57,7 +54,6 @@ def validate():
 
             if row:
                 if row[0].lower() == "no":
-                    # Mark as used
                     cursor.execute(
                         "UPDATE codes SET Used = 'Yes', BuyerName = ? WHERE Code = ?",
                         (buyer_name, user_code)
@@ -69,14 +65,11 @@ def validate():
             else:
                 return jsonify({"valid": False, "reason": "not_found"})
 
-# ---------- Home endpoint ----------
 @app.route("/")
 def home():
     return "Access Code Validator is running 🚀"
 
-# ---------- App startup ----------
 if __name__ == "__main__":
     init_db()
-    import_codes_from_csv()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
