@@ -1,22 +1,18 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3
-import os
+import sqlite3, os, re, csv, random, traceback
 from threading import Lock
-import csv
-import random
 from datetime import datetime, timedelta
-import traceback
 
 app = Flask(__name__)
 
-# -------- Strong CORS (works with Netlify) --------
+# ---- CORS ----
 CORS(
     app,
-    resources={r"/*": {"origins": "*"}},  # you can restrict to your Netlify origin later
+    resources={r"/*": {"origins": "*"}},  # restrict to your Netlify origin later
     supports_credentials=False,
     methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Key"],
     expose_headers=["Content-Type"],
     max_age=86400,
 )
@@ -25,19 +21,24 @@ CORS(
 def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key"
     return resp
 
-DB_FILE = "codes.db"
-CSV_FILE = "codes.csv"
-lock = Lock()  # Prevent race conditions
+# ---- DB / CSV (persistent if you set DB_FILE env, e.g. /var/data/codes.db) ----
+DB_FILE = os.environ.get("DB_FILE", "codes.db")
+CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
+lock = Lock()
 
-# ------------------- Database Initialization -------------------
+def normalize_code(s: str) -> str:
+    """Uppercase, trim, and allow only A-Z 0-9 _ -"""
+    s = (s or "").strip().upper()
+    return re.sub(r"[^A-Z0-9_-]", "", s)
+
 def init_db():
-    """Create table and load codes from CSV."""
+    """Create table and idempotently load codes from CSV (if present)."""
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        c = conn.cursor()
+        c.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 Code TEXT PRIMARY KEY,
                 Used TEXT DEFAULT 'No',
@@ -47,140 +48,209 @@ def init_db():
         """)
         conn.commit()
 
-        # Load codes from CSV into DB (idempotent)
         if os.path.exists(CSV_FILE):
-            with open(CSV_FILE, newline="", encoding="utf-8") as file:
-                reader = csv.DictReader(file)
+            with open(CSV_FILE, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
                 for row in reader:
-                    code = (row.get("Code") or "").strip()
+                    code = normalize_code(row.get("Code"))
                     if not code:
                         continue
                     used = (row.get("Used") or "No").strip()
                     buyer = (row.get("BuyerName") or "").strip()
-                    expiry = row.get("Expiry")
-                    if not expiry or not expiry.strip():
-                        expiry = (datetime.now() + timedelta(days=30)).isoformat()
-                    cursor.execute("""
+                    expiry = (row.get("Expiry") or "").strip()
+                    if not expiry:
+                        expiry = (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z"
+                    c.execute("""
                         INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry)
                         VALUES (?, ?, ?, ?)
                     """, (code, used, buyer, expiry))
             conn.commit()
 
-# ------------------- Health / Fingerprint -------------------
+# Ensure DB exists on import (works with gunicorn/Render)
+init_db()
+
+# ---- Health / info ----
 @app.route("/whoami")
 def whoami():
     return jsonify({
-        "service": os.environ.get("RENDER_SERVICE_NAME", "unknown"),
-        "url": os.environ.get("RENDER_EXTERNAL_URL", "n/a"),
-        "time": datetime.now().isoformat()
+        "service": os.environ.get("RENDER_SERVICE_NAME", "local"),
+        "env": os.environ.get("RENDER_EXTERNAL_URL", "n/a"),
+        "version": "v2",
+        "time": datetime.utcnow().isoformat() + "Z",
+        "db_file": DB_FILE
     })
 
-# ------------------- Access Code Validation -------------------
-@app.route("/validate", methods=["POST"])
+@app.route("/")
+def home():
+    return "Access Code Validator & Housie90 API running 🚀"
+
+# ---- VALIDATE (single-use; GET supported for quick tests) ----
+@app.route("/validate", methods=["POST", "GET"])
 def validate():
     try:
-        data = request.get_json(silent=True) or {}
-        user_code = (data.get("code") or "").strip()
-        buyer_name = (data.get("buyer") or "").strip()
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            user_code = normalize_code(data.get("code"))
+            buyer_name = (data.get("buyer") or "").strip()
+        else:
+            user_code = normalize_code(request.args.get("code"))
+            buyer_name = (request.args.get("buyer") or "").strip()
 
         if not user_code:
             return jsonify({"valid": False, "reason": "empty_code"}), 400
 
-        with lock:
-            with sqlite3.connect(DB_FILE) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT Used, Expiry FROM codes WHERE Code = ?", (user_code,))
-                row = cursor.fetchone()
+        with lock, sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            # Case-insensitive match
+            c.execute("SELECT Used, Expiry FROM codes WHERE UPPER(Code)=UPPER(?)", (user_code,))
+            row = c.fetchone()
+            if not row:
+                return jsonify({"valid": False, "reason": "not_found"})
+            used, expiry_str = row
 
-                if not row:
-                    return jsonify({"valid": False, "reason": "not_found"})
+            # parse expiry; default +30d
+            try:
+                expiry = datetime.fromisoformat(expiry_str.replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
+            except Exception:
+                expiry = datetime.utcnow() + timedelta(days=30)
 
-                used, expiry_str = row
-                # If expiry_str is None or bad, default to +30 days
-                try:
-                    expiry = datetime.fromisoformat(expiry_str) if expiry_str else (datetime.now() + timedelta(days=30))
-                except Exception:
-                    expiry = datetime.now() + timedelta(days=30)
+            if str(used or "No").strip().lower() == "yes":
+                return jsonify({"valid": False, "reason": "already_used"})
+            if expiry <= datetime.utcnow():
+                return jsonify({"valid": False, "reason": "expired"})
 
-                now = datetime.now()
-                if str(used).lower() == "yes":
-                    return jsonify({"valid": False, "reason": "already_used"})
-                if expiry < now:
-                    return jsonify({"valid": False, "reason": "expired"})
+            # mark used on successful validation
+            c.execute("""
+                UPDATE codes SET Used='Yes', BuyerName=?, Expiry=?
+                WHERE UPPER(Code)=UPPER(?)
+            """, (buyer_name, expiry.isoformat() + "Z", user_code))
+            conn.commit()
 
-                # Mark code as used and update buyer (keep same expiry)
-                cursor.execute("""
-                    UPDATE codes SET Used = 'Yes', BuyerName = ?, Expiry = ?
-                    WHERE Code = ?
-                """, (buyer_name, expiry.isoformat(), user_code))
-                conn.commit()
-
-                return jsonify({"valid": True, "expiry": expiry.isoformat(), "reason": "success"})
+        return jsonify({"valid": True, "expiry": expiry.isoformat() + "Z", "reason": "success"})
     except Exception as e:
-        print("Error:", e)
         traceback.print_exc()
         return jsonify({"valid": False, "reason": "server_error"}), 500
 
-# ------------------- Housie90 Ticket Generation -------------------
+# ---- ADMIN (manage codes) ----
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set to UKE202501 in Render env
+
+def _auth_ok(req):
+    return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
+
+@app.route("/admin/add_code", methods=["POST"])
+def admin_add_code():
+    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
+    data = request.get_json(silent=True) or {}
+    code = normalize_code(data.get("code"))
+    buyer = (data.get("buyer") or "").strip()
+    days = int(data.get("days") or 30)
+    if not code: return jsonify({"ok": False, "error": "missing_code"}), 400
+    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+    with lock, sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO codes (Code, Used, BuyerName, Expiry)
+            VALUES (?, 'No', ?, ?)
+            ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry
+        """, (code, buyer, expiry))
+        conn.commit()
+    return jsonify({"ok": True, "code": code, "expiry": expiry})
+
+@app.route("/admin/add_codes_bulk", methods=["POST"])
+def admin_add_codes_bulk():
+    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
+    data = request.get_json(silent=True) or {}
+    days = int(data.get("days") or 30)
+    buyer = (data.get("buyer") or "Batch").strip()
+    codes_list = data.get("codes")
+    if not codes_list and data.get("text"):
+        codes_list = [line for line in data["text"].splitlines() if line.strip()]
+    if not codes_list: return jsonify({"ok": False, "error": "no_codes_provided"}), 400
+
+    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+    added, normalized = 0, []
+    with lock, sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        for raw in codes_list:
+            code = normalize_code(raw)
+            if not code: continue
+            normalized.append(code)
+            c.execute("""
+                INSERT INTO codes (Code, Used, BuyerName, Expiry)
+                VALUES (?, 'No', ?, ?)
+                ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry
+            """, (code, buyer, expiry))
+            added += 1
+        conn.commit()
+    return jsonify({"ok": True, "count": added, "expiry": expiry, "codes": normalized})
+
+@app.route("/admin/reset_code", methods=["POST"])
+def admin_reset_code():
+    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
+    data = request.get_json(silent=True) or {}
+    code = normalize_code(data.get("code"))
+    if not code: return jsonify({"ok": False, "error": "missing_code"}), 400
+    with lock, sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE codes SET Used='No' WHERE UPPER(Code)=UPPER(?)", (code,))
+        if c.rowcount == 0:
+            return jsonify({"ok": False, "error": "not_found"}), 404
+        conn.commit()
+    return jsonify({"ok": True, "code": code, "status": "reset"})
+
+@app.route("/admin/list_codes", methods=["GET"])
+def admin_list_codes():
+    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
+    limit = int(request.args.get("limit", 200))
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT Code, Used, BuyerName, Expiry FROM codes ORDER BY Code LIMIT ?", (limit,))
+        rows = [{"Code": a, "Used": b, "BuyerName": d, "Expiry": e} for (a,b,d,e) in c.fetchall()]
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
+# ---- Housie90 Tickets ----
 @app.route("/api/tickets", methods=["GET"])
-def generate_tickets():
+def api_tickets():
     try:
-        count = int(request.args.get("cards", 1))
+        count = int(request.args.get("cards", 1))  # "cards" == strips
     except Exception:
         count = 1
+    count = max(1, min(count, 60))
 
-    # Keep a sane limit
-    if count < 1:
-        count = 1
-    elif count > 60:
-        count = 60
-
-    all_cards = [generate_ticket() for _ in range(count)]
-    return jsonify({"cards": all_cards})
+    # Return 6 tickets per "card"/strip to match your UI
+    all_tickets = []
+    for _ in range(count):
+        for __ in range(6):
+            all_tickets.append(generate_ticket())
+    return jsonify({"cards": all_tickets})
 
 def generate_ticket():
-    """
-    Generate a single Housie90 ticket:
-    - 3 rows x 9 columns
-    - Each row has exactly 5 numbers
-    - Correct column ranges
-    """
+    """Single ticket: 3x9, 5 numbers per row, proper column ranges."""
     ticket = [[0]*9 for _ in range(3)]
     columns = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
         list(range(60,70)), list(range(70,80)), list(range(80,91))
     ]
-
     for col in columns:
         random.shuffle(col)
-
     # choose 5 columns per row
-    row_columns = [random.sample(range(9), 5) for _ in range(3)]
-
+    row_cols = [random.sample(range(9), 5) for _ in range(3)]
     for r in range(3):
-        for c in row_columns[r]:
+        for c in row_cols[r]:
             ticket[r][c] = columns[c].pop()
-
-    # Optional: sort numbers per column (common housie style)
+    # sort numbers per column (style)
     for c in range(9):
-        col_vals = [ticket[r][c] for r in range(3) if ticket[r][c] != 0]
-        col_vals.sort()
+        vals = [ticket[r][c] for r in range(3) if ticket[r][c] != 0]
+        vals.sort()
         i = 0
         for r in range(3):
             if ticket[r][c] != 0:
-                ticket[r][c] = col_vals[i]
-                i += 1
-
+                ticket[r][c] = vals[i]; i += 1
     return ticket
 
-# ------------------- Home -------------------
-@app.route("/")
-def home():
-    return "Access Code Validator & Housie90 API running 🚀"
-
-# ------------------- Run Server -------------------
+# ---- Run ----
 if __name__ == "__main__":
+    # Already called once on import; harmless to call again locally
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
