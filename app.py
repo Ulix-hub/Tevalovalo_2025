@@ -9,7 +9,7 @@ app = Flask(__name__)
 # ---- CORS ----
 CORS(
     app,
-    resources={r"/*": {"origins": "*"}},  # restrict to your Netlify origin later
+    resources={r"/*": {"origins": "*"}},  # restrict later to your Netlify origin if you want
     supports_credentials=False,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Admin-Key"],
@@ -24,18 +24,21 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key"
     return resp
 
-# ---- DB / CSV (persistent if you set DB_FILE env, e.g. /var/data/codes.db) ----
+# ---- DB / CSV (persistent if DB_FILE is set to e.g. /var/data/codes.db) ----
 DB_FILE = os.environ.get("DB_FILE", "codes.db")
 CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
 lock = Lock()
 
 def normalize_code(s: str) -> str:
-    """Uppercase, trim, and allow only A-Z 0-9 _ -"""
     s = (s or "").strip().upper()
     return re.sub(r"[^A-Z0-9_-]", "", s)
 
 def init_db():
-    """Create table and idempotently load codes from CSV (if present)."""
+    # Ensure folder exists (fixes “unable to open database file” on Render if path includes dirs)
+    db_dir = os.path.dirname(DB_FILE)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("""
@@ -48,6 +51,7 @@ def init_db():
         """)
         conn.commit()
 
+        # Optional: seed from CSV if present
         if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -66,7 +70,7 @@ def init_db():
                     """, (code, used, buyer, expiry))
             conn.commit()
 
-# Ensure DB exists on import (works with gunicorn/Render)
+# Ensure DB exists on import (so it runs under gunicorn/Render)
 init_db()
 
 # ---- Health / info ----
@@ -101,16 +105,14 @@ def validate():
 
         with lock, sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
-            # Case-insensitive match
             c.execute("SELECT Used, Expiry FROM codes WHERE UPPER(Code)=UPPER(?)", (user_code,))
             row = c.fetchone()
             if not row:
                 return jsonify({"valid": False, "reason": "not_found"})
             used, expiry_str = row
 
-            # parse expiry; default +30d
             try:
-                expiry = datetime.fromisoformat(expiry_str.replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
+                expiry = datetime.fromisoformat((expiry_str or "").replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
             except Exception:
                 expiry = datetime.utcnow() + timedelta(days=30)
 
@@ -119,7 +121,6 @@ def validate():
             if expiry <= datetime.utcnow():
                 return jsonify({"valid": False, "reason": "expired"})
 
-            # mark used on successful validation
             c.execute("""
                 UPDATE codes SET Used='Yes', BuyerName=?, Expiry=?
                 WHERE UPPER(Code)=UPPER(?)
@@ -127,12 +128,12 @@ def validate():
             conn.commit()
 
         return jsonify({"valid": True, "expiry": expiry.isoformat() + "Z", "reason": "success"})
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         return jsonify({"valid": False, "reason": "server_error"}), 500
 
-# ---- ADMIN (manage codes) ----
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set to UKE202501 in Render env
+# ---- ADMIN ----
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 
 def _auth_ok(req):
     return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
@@ -208,16 +209,14 @@ def admin_list_codes():
         rows = [{"Code": a, "Used": b, "BuyerName": d, "Expiry": e} for (a,b,d,e) in c.fetchall()]
     return jsonify({"ok": True, "rows": rows, "count": len(rows)})
 
-# ---- Housie90 Tickets ----
+# ---- Tickets (6 tickets per “card”) ----
 @app.route("/api/tickets", methods=["GET"])
 def api_tickets():
     try:
-        count = int(request.args.get("cards", 1))  # "cards" == strips
+        count = int(request.args.get("cards", 1))
     except Exception:
         count = 1
     count = max(1, min(count, 60))
-
-    # Return 6 tickets per "card"/strip to match your UI
     all_tickets = []
     for _ in range(count):
         for __ in range(6):
@@ -225,21 +224,17 @@ def api_tickets():
     return jsonify({"cards": all_tickets})
 
 def generate_ticket():
-    """Single ticket: 3x9, 5 numbers per row, proper column ranges."""
     ticket = [[0]*9 for _ in range(3)]
     columns = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
         list(range(60,70)), list(range(70,80)), list(range(80,91))
     ]
-    for col in columns:
-        random.shuffle(col)
-    # choose 5 columns per row
+    for col in columns: random.shuffle(col)
     row_cols = [random.sample(range(9), 5) for _ in range(3)]
     for r in range(3):
         for c in row_cols[r]:
             ticket[r][c] = columns[c].pop()
-    # sort numbers per column (style)
     for c in range(9):
         vals = [ticket[r][c] for r in range(3) if ticket[r][c] != 0]
         vals.sort()
@@ -249,8 +244,7 @@ def generate_ticket():
                 ticket[r][c] = vals[i]; i += 1
     return ticket
 
-# ---- Run ----
+# ---- Run local ----
 if __name__ == "__main__":
-    # Already called once on import; harmless to call again locally
-    init_db()
+    init_db()  # harmless second call
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
