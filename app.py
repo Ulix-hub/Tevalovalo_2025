@@ -164,87 +164,64 @@ def _get_max_devices(row):
     except Exception:
         return MAX_DEVICES_DEFAULT
 
-@app.route("/validate", methods=["POST", "GET"])
-def validate():
-    try:
-        if request.method == "POST":
-            data = request.get_json(silent=True) or {}
-            user_code = normalize_code(data.get("code"))
-            buyer_name = (data.get("buyer") or "").strip()
-            device_id = (data.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
-        else:
-            user_code = normalize_code(request.args.get("code"))
-            buyer_name = (request.args.get("buyer") or "").strip()
-            device_id = (request.args.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
+@app.route("/admin/new_codes_secure", methods=["POST", "GET"])
+def admin_new_codes_secure():
+    if not _auth_ok(request): 
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
 
-        if not user_code:
-            return jsonify({"valid": False, "reason": "empty_code"}), 400
-        if not device_id:
-            return jsonify({"valid": False, "reason": "missing_device_id"}), 400
+    # ✅ Never trigger 415: parse JSON only if present, and silently
+    payload = request.get_json(silent=True) or {}
+    args = request.args
 
-        # Support master code for testing/support; binds to device but ignores DB
-        if MASTER_CODE and user_code == normalize_code(MASTER_CODE):
-            return jsonify({
-                "valid": True,
-                "token": f"master-{device_id}",
-                "expires_at": (datetime.utcnow()+timedelta(days=3650)).isoformat()+"Z",
-                "device_registered": True,
-                "reason": "master"
-            })
+    def pick(key, default=None, caster=lambda x: x):
+        val = args.get(key)
+        if val is None:
+            val = payload.get(key)
+        if val is None:
+            return default
+        try:
+            return caster(val)
+        except Exception:
+            return default
 
-        with lock, sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            # Compare against DB after stripping hyphens in stored values too
-            row = c.execute("""
-                SELECT Code, Used, BuyerName, Expiry, MaxDevices
-                FROM codes
-                WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
-            """, (user_code,)).fetchone()
-            if not row:
-                return jsonify({"valid": False, "reason": "not_found"}), 404
+    n           = pick("n", 1, int)
+    n           = max(1, min(n, 2000))      # safety cap
+    days        = pick("days", 30, int)
+    prefix      = (pick("prefix", "", str) or "").strip().upper()
+    groups      = pick("groups", 4, int)
+    group_len   = pick("group_len", 4, int)
+    buyer       = (pick("buyer", "", str) or "").strip()
+    max_devices = pick("max_devices", MAX_DEVICES_DEFAULT, int)
 
-            # Expiry check
-            expiry_str = row["Expiry"]
-            try:
-                expiry = datetime.fromisoformat((expiry_str or "").replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
-            except Exception:
-                expiry = datetime.utcnow() + timedelta(days=30)
-            if expiry <= datetime.utcnow():
-                return jsonify({"valid": False, "reason": "expired"}), 400
+    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
 
-            # Is this device already activated for this code?
-            already = c.execute("SELECT 1 FROM activations WHERE Code=? AND DeviceID=?", (row["Code"], device_id)).fetchone()
-            if already:
-                # idempotent: allow reuse on the same device
-                return jsonify({
-                    "valid": True,
-                    "token": f"lic-{row['Code']}-{device_id}",
-                    "expires_at": expiry.isoformat()+"Z",
-                    "device_registered": True,
-                    "reason": "ok_same_device"
-                })
+    made = []
+    with lock, sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        for _ in range(n):
+            canonical, display = make_secure_code(
+                prefix=prefix, groups=groups, group_len=group_len, add_check=True
+            )
+            # store canonical (no hyphens, no prefix)
+            c.execute("""
+                INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
+                VALUES (?, 'No', ?, ?, ?)
+                ON CONFLICT(Code) DO UPDATE SET 
+                    Used='No', BuyerName=excluded.BuyerName, 
+                    Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
+            """, (canonical, buyer, expiry, max_devices))
+            made.append({"display": display, "canonical": canonical})
+        conn.commit()
 
-            # Count distinct devices
-            cnt = c.execute("SELECT COUNT(*) FROM activations WHERE Code=?", (row["Code"],)).fetchone()[0]
-            max_devices = _get_max_devices(row)
-            if cnt >= max_devices:
-                return jsonify({"valid": False, "reason": "device_limit"}), 403
+    return jsonify({
+        "ok": True,
+        "count": len(made),
+        "days": days,
+        "expiry": expiry,
+        "max_devices": max_devices,
+        "codes": made
+    })
 
-            # Register this device
-            c.execute("INSERT OR IGNORE INTO activations (Code, DeviceID, FirstSeen) VALUES (?, ?, ?)", (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
-            # Mark used on first activation for backwards compatibility
-            if str(row["Used"] or "No").strip().lower() != "yes":
-                c.execute("UPDATE codes SET Used='Yes', BuyerName=COALESCE(?, BuyerName) WHERE Code=?", (buyer_name, row["Code"]))
-            conn.commit()
-
-            return jsonify({
-                "valid": True,
-                "token": f"lic-{row['Code']}-{device_id}",
-                "expires_at": expiry.isoformat()+"Z",
-                "device_registered": True,
-                "reason": "ok_new_device"
-            })
     except Exception:
         traceback.print_exc()
         return jsonify({"valid": False, "reason": "server_error"}), 500
@@ -432,3 +409,4 @@ def generate_ticket():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
