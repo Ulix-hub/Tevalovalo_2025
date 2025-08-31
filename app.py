@@ -30,9 +30,57 @@ CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
 MAX_DEVICES_DEFAULT = int(os.environ.get("MAX_DEVICES_DEFAULT", "1"))
 lock = Lock()
 
+# ===== Secure code alphabet + helpers (Base32 w/out 0/1/I/O) =====
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 symbols
+ALPH_LEN = len(ALPHABET)
+CHAR_TO_VAL = {ch: i for i, ch in enumerate(ALPHABET)}
+
+def luhn_mod_n_check_index(values, n=ALPH_LEN):
+    """
+    Luhn mod N checksum index for a list of digit indexes in base N.
+    Generalized Luhn (double from right; sum of digits in base N).
+    """
+    factor = 2
+    total = 0
+    for v in reversed(values):
+        addend = factor * v
+        addend = (addend // n) + (addend % n)
+        total += addend
+        factor = 1 if factor == 2 else 2
+    return (-total) % n
+
+def make_secure_code(prefix="", groups=4, group_len=4, add_check=True):
+    """
+    Builds a display code like: TV-7XGM-Q2HN-8R3K-L  (L = check char)
+    Returns (canonical_no_hyphens_no_prefix, display_with_hyphens_and_optional_prefix)
+    """
+    # total body length = groups*group_len; reserve last char for check if add_check=True
+    payload_len = groups * group_len - (1 if add_check else 0)
+    vals = [secrets.randbelow(ALPH_LEN) for _ in range(payload_len)]
+    if add_check:
+        chk = luhn_mod_n_check_index(vals)
+        vals.append(chk)
+
+    body = "".join(ALPHABET[v] for v in vals)
+    chunks = [body[i:i+group_len] for i in range(0, len(body), group_len)]
+    display = "-".join(chunks)
+    display = f"{prefix.strip().upper()}-{display}" if prefix else display
+
+    canonical = display.replace("-", "")
+    if prefix:
+        canonical = canonical[len(prefix):]  # strip prefix portion from canonical
+    return canonical, display
+
+# ===== Normalization =====
 def normalize_code(s: str) -> str:
+    """
+    Normalize user-provided code:
+    - Uppercase
+    - Strip ALL non-alphanumerics (hyphens/spaces removed)
+    Works for existing simple codes and new secure codes.
+    """
     s = (s or "").strip().upper()
-    return re.sub(r"[^A-Z0-9_-]", "", s)
+    return re.sub(r"[^A-Z0-9]", "", s)
 
 def init_db():
     db_dir = os.path.dirname(DB_FILE)
@@ -68,12 +116,13 @@ def init_db():
             c.execute("ALTER TABLE codes ADD COLUMN MaxDevices INTEGER DEFAULT 1")
         conn.commit()
 
-        # Optional: seed from CSV
+        # Optional: seed from CSV (normalize for canonical storage)
         if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    code = normalize_code(row.get("Code"))
+                    raw_code = row.get("Code")
+                    code = normalize_code(raw_code)
                     if not code:
                         continue
                     used = (row.get("Used") or "No").strip()
@@ -97,7 +146,7 @@ def whoami():
     return jsonify({
         "service": os.environ.get("RENDER_SERVICE_NAME", "local"),
         "env": os.environ.get("RENDER_EXTERNAL_URL", "n/a"),
-        "version": "v3-device-bind",
+        "version": "v4-secure-codes",
         "time": datetime.utcnow().isoformat() + "Z",
         "db_file": DB_FILE
     })
@@ -146,7 +195,12 @@ def validate():
         with lock, sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            row = c.execute("SELECT Code, Used, BuyerName, Expiry, MaxDevices FROM codes WHERE UPPER(Code)=UPPER(?)", (user_code,)).fetchone()
+            # Compare against DB after stripping hyphens in stored values too
+            row = c.execute("""
+                SELECT Code, Used, BuyerName, Expiry, MaxDevices
+                FROM codes
+                WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
+            """, (user_code,)).fetchone()
             if not row:
                 return jsonify({"valid": False, "reason": "not_found"}), 404
 
@@ -198,7 +252,6 @@ def validate():
 # ---- ADMIN (existing + new) ----
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 
-
 def _auth_ok(req):
     return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
 
@@ -206,6 +259,7 @@ def _auth_ok(req):
 def admin_add_code():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
     data = request.get_json(silent=True) or {}
+    # store canonical form
     code = normalize_code(data.get("code"))
     buyer = (data.get("buyer") or "").strip()
     days = int(data.get("days") or 30)
@@ -217,7 +271,8 @@ def admin_add_code():
         c.execute(
             """INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                VALUES (?, 'No', ?, ?, ?)
-               ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices""",            (code, buyer, expiry, max_devices)
+               ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices""",
+            (code, buyer, expiry, max_devices)
         )
         conn.commit()
     return jsonify({"ok": True, "code": code, "expiry": expiry, "max_devices": max_devices})
@@ -241,6 +296,7 @@ def admin_new_codes():
         c = conn.cursor()
         for _ in range(n):
             code = _make_code(prefix)
+            # keep legacy behavior (store as-is) for backward compatibility
             c.execute(
                 "INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry, MaxDevices) VALUES (?, 'No', ?, ?, ?)",
                 (code, buyer, expiry, max_devices)
@@ -249,18 +305,60 @@ def admin_new_codes():
         conn.commit()
     return jsonify({"ok": True, "count": len(made), "expiry": expiry, "max_devices": max_devices, "codes": made})
 
+# NEW: Production-grade codes (hard to guess, with check digit). Stores canonical; returns pretty display.
+@app.route("/admin/new_codes_secure", methods=["POST", "GET"])
+def admin_new_codes_secure():
+    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    try:
+        n = int(request.args.get("n") or (request.json or {}).get("n") or 1)
+    except:
+        n = 1
+    n = max(1, min(n, 2000))  # safety cap
+
+    try:
+        days = int(request.args.get("days") or (request.json or {}).get("days") or 30)
+    except:
+        days = 30
+
+    prefix = (request.args.get("prefix") or (request.json or {}).get("prefix") or "").strip().upper()
+    groups = int(request.args.get("groups") or 4)
+    group_len = int(request.args.get("group_len") or 4)
+    buyer  = (request.args.get("buyer") or (request.json or {}).get("buyer") or "").strip()
+    max_devices = int(request.args.get("max_devices") or (request.json or {}).get("max_devices") or MAX_DEVICES_DEFAULT)
+
+    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+
+    made = []
+    with lock, sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        for _ in range(n):
+            canonical, display = make_secure_code(prefix=prefix, groups=groups, group_len=group_len, add_check=True)
+            # store canonical (no hyphens, no prefix) so validation is robust
+            c.execute("""
+                INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
+                VALUES (?, 'No', ?, ?, ?)
+                ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
+            """, (canonical, buyer, expiry, max_devices))
+            made.append({"display": display, "canonical": canonical})
+        conn.commit()
+
+    return jsonify({"ok": True, "count": len(made), "days": days, "expiry": expiry, "max_devices": max_devices, "codes": made})
+
 @app.post("/admin/reset_code")
 def admin_reset_code():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
     data = request.get_json(silent=True) or {}
-    code = normalize_code(data.get("code"))
-    if not code: return jsonify({"ok": False, "error": "missing_code"}), 400
+    raw = data.get("code")
+    if not raw: return jsonify({"ok": False, "error": "missing_code"}), 400
+    norm = normalize_code(raw)
     with lock, sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute("UPDATE codes SET Used='No' WHERE UPPER(Code)=UPPER(?)", (code,))
-        c.execute("DELETE FROM activations WHERE UPPER(Code)=UPPER(?)", (code,))
+        # match regardless of hyphens in stored codes
+        c.execute("UPDATE codes SET Used='No' WHERE UPPER(REPLACE(Code,'-',''))=UPPER(?)", (norm,))
+        c.execute("DELETE FROM activations WHERE UPPER(REPLACE(Code,'-',''))=UPPER(?)", (norm,))
         conn.commit()
-    return jsonify({"ok": True, "code": code, "status": "reset"})
+    return jsonify({"ok": True, "code": norm, "status": "reset"})
 
 @app.get("/admin/list_codes")
 def admin_list_codes():
