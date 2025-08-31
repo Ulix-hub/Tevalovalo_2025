@@ -24,63 +24,57 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Device-Id"
     return resp
 
-# ---- DB ----
+# ---- DB / config ----
 DB_FILE = os.environ.get("DB_FILE", "codes.db")
 CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
 MAX_DEVICES_DEFAULT = int(os.environ.get("MAX_DEVICES_DEFAULT", "1"))
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+MASTER_CODE = (os.environ.get("MASTER_CODE") or "").strip()
+
 lock = Lock()
 
-# ===== Secure code alphabet + helpers (Base32 w/out 0/1/I/O) =====
-ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 symbols
-ALPH_LEN = len(ALPHABET)
-CHAR_TO_VAL = {ch: i for i, ch in enumerate(ALPHABET)}
+def normalize_code(s: str) -> str:
+    s = (s or "").strip().upper()
+    return re.sub(r"[^A-Z0-9_-]", "", s)
 
-def luhn_mod_n_check_index(values, n=ALPH_LEN):
-    """
-    Luhn mod N checksum index for a list of digit indexes in base N.
-    Generalized Luhn (double from right; sum of digits in base N).
-    """
-    factor = 2
-    total = 0
-    for v in reversed(values):
-        addend = factor * v
-        addend = (addend // n) + (addend % n)
-        total += addend
-        factor = 1 if factor == 2 else 2
-    return (-total) % n
+# === Secure code helpers (checksum + canonical form) ===
+ALPH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # avoid I, O, 0, 1
 
-def make_secure_code(prefix="", groups=4, group_len=4, add_check=True):
-    """
-    Builds a display code like: TV-7XGM-Q2HN-8R3K-L  (L = check char)
-    Returns (canonical_no_hyphens_no_prefix, display_with_hyphens_and_optional_prefix)
-    """
-    # total body length = groups*group_len; reserve last char for check if add_check=True
-    payload_len = groups * group_len - (1 if add_check else 0)
-    vals = [secrets.randbelow(ALPH_LEN) for _ in range(payload_len)]
-    if add_check:
-        chk = luhn_mod_n_check_index(vals)
-        vals.append(chk)
+def _checksum(text: str) -> str:
+    s = 0
+    for ch in text:
+        s = (s * 31 + ord(ch)) % len(ALPH)
+    return ALPH[s % len(ALPH)]
 
-    body = "".join(ALPHABET[v] for v in vals)
-    chunks = [body[i:i+group_len] for i in range(0, len(body), group_len)]
-    display = "-".join(chunks)
-    display = f"{prefix.strip().upper()}-{display}" if prefix else display
+def make_secure_code(prefix: str = "", groups: int = 4, group_len: int = 4, add_check: bool = True):
+    """
+    Returns (canonical, display)
+    display: PREFIX-XXXX-XXXX-XXXX-C
+    canonical: PREFIXXXXXXXXXXXXXC  (uppercase, no dashes)
+    """
+    prefix = (prefix or "").upper().replace("-", "").strip()
+    groups = max(3, groups)       # at least 3 groups incl. checksum
+    group_len = max(4, group_len) # at least 4 chars per group
+    body_len = (groups - 1) * group_len   # last "group" is checksum
+    body = "".join(secrets.choice(ALPH) for _ in range(body_len))
+    core = prefix + body
+    chk = _checksum(core) if add_check else ""
 
-    canonical = display.replace("-", "")
+    parts = []
     if prefix:
-        canonical = canonical[len(prefix):]  # strip prefix portion from canonical
+        parts.append(prefix)
+    for i in range(0, len(body), group_len):
+        parts.append(body[i : i + group_len])
+    if add_check:
+        parts.append(chk)
+
+    display = "-".join(parts)
+    canonical = re.sub(r"[^A-Z0-9]", "", display.upper())
     return canonical, display
 
-# ===== Normalization =====
-def normalize_code(s: str) -> str:
-    """
-    Normalize user-provided code:
-    - Uppercase
-    - Strip ALL non-alphanumerics (hyphens/spaces removed)
-    Works for existing simple codes and new secure codes.
-    """
-    s = (s or "").strip().upper()
-    return re.sub(r"[^A-Z0-9]", "", s)
+def display_to_canonical(s: str) -> str:
+    """Uppercase and strip any non [A-Z0-9] (removes dashes/spaces)."""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
 def init_db():
     db_dir = os.path.dirname(DB_FILE)
@@ -89,7 +83,7 @@ def init_db():
 
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        # Main codes table (with MaxDevices)
+        # Main codes table (canonical Code, with MaxDevices)
         c.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 Code TEXT PRIMARY KEY,
@@ -99,7 +93,7 @@ def init_db():
                 MaxDevices INTEGER DEFAULT 1
             )
         """)
-        # Activation table: one row per (Code, DeviceID)
+        # Device activations
         c.execute("""
             CREATE TABLE IF NOT EXISTS activations (
                 Code TEXT NOT NULL,
@@ -109,20 +103,24 @@ def init_db():
                 FOREIGN KEY (Code) REFERENCES codes(Code) ON DELETE CASCADE
             )
         """)
-        # Try to add MaxDevices if older DB exists without it
+        # Helpful indexes
+        c.execute("CREATE INDEX IF NOT EXISTS idx_activations_code ON activations(Code)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_codes_expiry ON codes(Expiry)")
+
+        # Try to add MaxDevices if older DB existed
         try:
             c.execute("SELECT MaxDevices FROM codes LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE codes ADD COLUMN MaxDevices INTEGER DEFAULT 1")
         conn.commit()
 
-        # Optional: seed from CSV (normalize for canonical storage)
+        # Optional seed from CSV (legacy)
         if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    raw_code = row.get("Code")
-                    code = normalize_code(raw_code)
+                    raw = row.get("Code")
+                    code = display_to_canonical(raw)
                     if not code:
                         continue
                     used = (row.get("Used") or "No").strip()
@@ -131,11 +129,10 @@ def init_db():
                     maxdev = int((row.get("MaxDevices") or MAX_DEVICES_DEFAULT) or 1)
                     if not expiry:
                         expiry = (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z"
-                    c.execute(
-                        """INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (code, used, buyer, expiry, maxdev)
-                    )
+                    c.execute("""
+                        INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (code, used, buyer, expiry, maxdev))
             conn.commit()
 
 init_db()
@@ -153,10 +150,11 @@ def whoami():
 
 @app.get("/")
 def home():
-    return "Access Code Validator & Housie90 API (Device-Bound) 🚀"
+    return "Access Code Validator & Housie90 API (Device-Bound, Secure Codes) 🚀"
 
-# ---- VALIDATE (device-bound, monthly expiry supported) ----
-MASTER_CODE = os.environ.get("MASTER_CODE", "").strip()
+# ---- Helpers ----
+def _auth_ok(req):
+    return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
 
 def _get_max_devices(row):
     try:
@@ -164,12 +162,101 @@ def _get_max_devices(row):
     except Exception:
         return MAX_DEVICES_DEFAULT
 
+# ---- VALIDATE (device-bound; supports legacy + secure codes) ----
+@app.route("/validate", methods=["POST", "GET"])
+def validate():
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            raw_code = (data.get("code") or "")
+            buyer_name = (data.get("buyer") or "").strip()
+            device_id = (data.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
+        else:
+            raw_code = (request.args.get("code") or "")
+            buyer_name = (request.args.get("buyer") or "").strip()
+            device_id = (request.args.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
+
+        if not raw_code:
+            return jsonify({"valid": False, "reason": "empty_code"}), 400
+        if not device_id:
+            return jsonify({"valid": False, "reason": "missing_device_id"}), 400
+
+        user_code = display_to_canonical(raw_code)
+
+        # Master code (binds to device, 10y)
+        if MASTER_CODE and user_code == display_to_canonical(MASTER_CODE):
+            return jsonify({
+                "valid": True,
+                "token": f"master-{device_id}",
+                "expires_at": (datetime.utcnow()+timedelta(days=3650)).isoformat()+"Z",
+                "device_registered": True,
+                "reason": "master"
+            })
+
+        with lock, sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            # Look up canonical first
+            row = c.execute("SELECT Code, Used, BuyerName, Expiry, MaxDevices FROM codes WHERE Code = ?", (user_code,)).fetchone()
+            if not row:
+                # Fallback legacy normalization
+                row = c.execute("SELECT Code, Used, BuyerName, Expiry, MaxDevices FROM codes WHERE UPPER(Code)=UPPER(?)", (normalize_code(raw_code),)).fetchone()
+                if not row:
+                    return jsonify({"valid": False, "reason": "not_found"}), 404
+
+            # Expiry
+            expiry_str = row["Expiry"]
+            try:
+                expiry = datetime.fromisoformat((expiry_str or "").replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
+            except Exception:
+                expiry = datetime.utcnow() + timedelta(days=30)
+            if expiry <= datetime.utcnow():
+                return jsonify({"valid": False, "reason": "expired"}), 400
+
+            # Already activated on this device?
+            already = c.execute("SELECT 1 FROM activations WHERE Code=? AND DeviceID=?", (row["Code"], device_id)).fetchone()
+            if already:
+                return jsonify({
+                    "valid": True,
+                    "token": f"lic-{row['Code']}-{device_id}",
+                    "expires_at": expiry.isoformat()+"Z",
+                    "device_registered": True,
+                    "reason": "ok_same_device"
+                })
+
+            # Device limit
+            cnt = c.execute("SELECT COUNT(*) FROM activations WHERE Code=?", (row["Code"],)).fetchone()[0]
+            max_devices = _get_max_devices(row)
+            if cnt >= max_devices:
+                return jsonify({"valid": False, "reason": "device_limit"}), 403
+
+            # Register this device
+            c.execute("INSERT OR IGNORE INTO activations (Code, DeviceID, FirstSeen) VALUES (?, ?, ?)",
+                      (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
+            # Mark used on first activation
+            if str(row["Used"] or "No").strip().lower() != "yes":
+                c.execute("UPDATE codes SET Used='Yes', BuyerName=COALESCE(?, BuyerName) WHERE Code=?",
+                          (buyer_name, row["Code"]))
+            conn.commit()
+
+            return jsonify({
+                "valid": True,
+                "token": f"lic-{row['Code']}-{device_id}",
+                "expires_at": expiry.isoformat()+"Z",
+                "device_registered": True,
+                "reason": "ok_new_device"
+            })
+    except Exception:
+        traceback.print_exc()
+        return jsonify({"valid": False, "reason": "server_error"}), 500
+
+# ---- ADMIN: secure code generator (GET or POST JSON; no 415) ----
 @app.route("/admin/new_codes_secure", methods=["POST", "GET"])
 def admin_new_codes_secure():
-    if not _auth_ok(request): 
+    if not _auth_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 403
 
-    # ✅ Never trigger 415: parse JSON only if present, and silently
     payload = request.get_json(silent=True) or {}
     args = request.args
 
@@ -184,8 +271,8 @@ def admin_new_codes_secure():
         except Exception:
             return default
 
-    n           = pick("n", 1, int)
-    n           = max(1, min(n, 2000))      # safety cap
+    n           = pick("n", 10, int)
+    n           = max(1, min(n, 2000))
     days        = pick("days", 30, int)
     prefix      = (pick("prefix", "", str) or "").strip().upper()
     groups      = pick("groups", 4, int)
@@ -199,10 +286,7 @@ def admin_new_codes_secure():
     with lock, sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         for _ in range(n):
-            canonical, display = make_secure_code(
-                prefix=prefix, groups=groups, group_len=group_len, add_check=True
-            )
-            # store canonical (no hyphens, no prefix)
+            canonical, display = make_secure_code(prefix=prefix, groups=groups, group_len=group_len, add_check=True)
             c.execute("""
                 INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                 VALUES (?, 'No', ?, ?, ?)
@@ -216,28 +300,18 @@ def admin_new_codes_secure():
     return jsonify({
         "ok": True,
         "count": len(made),
-        "days": days,
         "expiry": expiry,
         "max_devices": max_devices,
         "codes": made
     })
 
-    except Exception:
-        traceback.print_exc()
-        return jsonify({"valid": False, "reason": "server_error"}), 500
-
-# ---- ADMIN (existing + new) ----
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-
-def _auth_ok(req):
-    return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
-
+# ---- ADMIN: legacy add/reset/list/export/stats (kept) ----
 @app.post("/admin/add_code")
 def admin_add_code():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
     data = request.get_json(silent=True) or {}
-    # store canonical form
-    code = normalize_code(data.get("code"))
+    raw = data.get("code")
+    code = display_to_canonical(raw)
     buyer = (data.get("buyer") or "").strip()
     days = int(data.get("days") or 30)
     max_devices = int(data.get("max_devices") or MAX_DEVICES_DEFAULT)
@@ -245,97 +319,28 @@ def admin_add_code():
     expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
     with lock, sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute(
-            """INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
-               VALUES (?, 'No', ?, ?, ?)
-               ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices""",
-            (code, buyer, expiry, max_devices)
-        )
+        c.execute("""
+            INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
+            VALUES (?, 'No', ?, ?, ?)
+            ON CONFLICT(Code) DO UPDATE SET 
+                Used='No', BuyerName=excluded.BuyerName, 
+                Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
+        """, (code, buyer, expiry, max_devices))
         conn.commit()
     return jsonify({"ok": True, "code": code, "expiry": expiry, "max_devices": max_devices})
-
-@app.post("/admin/new_codes")  # ?n=20&days=30&prefix=TV&buyer=Uli&max_devices=1
-def admin_new_codes():
-    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
-    n      = int(request.args.get("n", 10))
-    days   = int(request.args.get("days", 30))
-    prefix = request.args.get("prefix")
-    buyer  = request.args.get("buyer", "")
-    max_devices = int(request.args.get("max_devices", MAX_DEVICES_DEFAULT))
-    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
-
-    def _make_code(prefix=None):
-        body = (secrets.token_urlsafe(5).replace("_","" ).replace("-","").upper())[:10]
-        return f"{prefix}-{body}" if prefix else body
-
-    made = []
-    with lock, sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        for _ in range(n):
-            code = _make_code(prefix)
-            # keep legacy behavior (store as-is) for backward compatibility
-            c.execute(
-                "INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry, MaxDevices) VALUES (?, 'No', ?, ?, ?)",
-                (code, buyer, expiry, max_devices)
-            )
-            made.append(code)
-        conn.commit()
-    return jsonify({"ok": True, "count": len(made), "expiry": expiry, "max_devices": max_devices, "codes": made})
-
-# NEW: Production-grade codes (hard to guess, with check digit). Stores canonical; returns pretty display.
-@app.route("/admin/new_codes_secure", methods=["POST", "GET"])
-def admin_new_codes_secure():
-    if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
-
-    try:
-        n = int(request.args.get("n") or (request.json or {}).get("n") or 1)
-    except:
-        n = 1
-    n = max(1, min(n, 2000))  # safety cap
-
-    try:
-        days = int(request.args.get("days") or (request.json or {}).get("days") or 30)
-    except:
-        days = 30
-
-    prefix = (request.args.get("prefix") or (request.json or {}).get("prefix") or "").strip().upper()
-    groups = int(request.args.get("groups") or 4)
-    group_len = int(request.args.get("group_len") or 4)
-    buyer  = (request.args.get("buyer") or (request.json or {}).get("buyer") or "").strip()
-    max_devices = int(request.args.get("max_devices") or (request.json or {}).get("max_devices") or MAX_DEVICES_DEFAULT)
-
-    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
-
-    made = []
-    with lock, sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        for _ in range(n):
-            canonical, display = make_secure_code(prefix=prefix, groups=groups, group_len=group_len, add_check=True)
-            # store canonical (no hyphens, no prefix) so validation is robust
-            c.execute("""
-                INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
-                VALUES (?, 'No', ?, ?, ?)
-                ON CONFLICT(Code) DO UPDATE SET Used='No', BuyerName=excluded.BuyerName, Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
-            """, (canonical, buyer, expiry, max_devices))
-            made.append({"display": display, "canonical": canonical})
-        conn.commit()
-
-    return jsonify({"ok": True, "count": len(made), "days": days, "expiry": expiry, "max_devices": max_devices, "codes": made})
 
 @app.post("/admin/reset_code")
 def admin_reset_code():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
     data = request.get_json(silent=True) or {}
-    raw = data.get("code")
-    if not raw: return jsonify({"ok": False, "error": "missing_code"}), 400
-    norm = normalize_code(raw)
+    code = display_to_canonical(data.get("code"))
+    if not code: return jsonify({"ok": False, "error": "missing_code"}), 400
     with lock, sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        # match regardless of hyphens in stored codes
-        c.execute("UPDATE codes SET Used='No' WHERE UPPER(REPLACE(Code,'-',''))=UPPER(?)", (norm,))
-        c.execute("DELETE FROM activations WHERE UPPER(REPLACE(Code,'-',''))=UPPER(?)", (norm,))
+        c.execute("UPDATE codes SET Used='No' WHERE Code=?", (code,))
+        c.execute("DELETE FROM activations WHERE Code=?", (code,))
         conn.commit()
-    return jsonify({"ok": True, "code": norm, "status": "reset"})
+    return jsonify({"ok": True, "code": code, "status": "reset"})
 
 @app.get("/admin/list_codes")
 def admin_list_codes():
@@ -409,4 +414,3 @@ def generate_ticket():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
