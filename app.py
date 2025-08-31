@@ -390,41 +390,93 @@ def admin_export_csv():
     return Response(csv_bytes, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=codes_export.csv"})
 
 # ---- Tickets ----
-@app.get("/api/tickets")
-def api_tickets():
+@app.route("/validate", methods=["POST", "GET"])
+def validate():
     try:
-        count = int(request.args.get("cards", 1))
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            user_code = normalize_code(data.get("code"))
+            buyer_name = (data.get("buyer") or "").strip()
+            device_id = (data.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
+        else:
+            user_code = normalize_code(request.args.get("code"))
+            buyer_name = (request.args.get("buyer") or "").strip()
+            device_id = (request.args.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
+
+        if not user_code:
+            return jsonify({"valid": False, "reason": "empty_code"}), 400
+        if not device_id:
+            return jsonify({"valid": False, "reason": "missing_device_id"}), 400
+
+        # Master code (optional)
+        if MASTER_CODE and user_code == normalize_code(MASTER_CODE):
+            return jsonify({
+                "valid": True,
+                "token": f"master-{device_id}",
+                "expires_at": (datetime.utcnow()+timedelta(days=3650)).isoformat()+"Z",
+                "device_registered": True,
+                "reason": "master"
+            }), 200
+
+        with lock, sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            # Match tail of the user input against stored canonical (no hyphens)
+            row = c.execute("""
+                SELECT Code, Used, BuyerName, Expiry, MaxDevices
+                FROM codes
+                WHERE UPPER(REPLACE(Code,'-','')) =
+                      UPPER(substr(?, -length(REPLACE(Code,'-',''))))
+            """, (user_code,)).fetchone()
+
+            if not row:
+                # Return 200 so PowerShell can read the JSON without throwing
+                return jsonify({"valid": False, "reason": "not_found"}), 200
+
+            # Expiry
+            expiry_str = row["Expiry"]
+            try:
+                expiry = datetime.fromisoformat((expiry_str or "").replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
+            except Exception:
+                expiry = datetime.utcnow() + timedelta(days=30)
+            if expiry <= datetime.utcnow():
+                return jsonify({"valid": False, "reason": "expired"}), 200
+
+            # Already activated on this device?
+            already = c.execute("SELECT 1 FROM activations WHERE Code=? AND DeviceID=?", (row["Code"], device_id)).fetchone()
+            if already:
+                return jsonify({
+                    "valid": True,
+                    "token": f"lic-{row['Code']}-{device_id}",
+                    "expires_at": expiry.isoformat()+"Z",
+                    "device_registered": True,
+                    "reason": "ok_same_device"
+                }), 200
+
+            # Device limit
+            cnt = c.execute("SELECT COUNT(*) FROM activations WHERE Code=?", (row["Code"],)).fetchone()[0]
+            max_devices = int(row["MaxDevices"])
+            if cnt >= max_devices:
+                return jsonify({"valid": False, "reason": "device_limit"}), 200
+
+            # Register device + mark used
+            c.execute("INSERT OR IGNORE INTO activations (Code, DeviceID, FirstSeen) VALUES (?, ?, ?)",
+                      (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
+            if str(row["Used"] or "No").strip().lower() != "yes":
+                c.execute("UPDATE codes SET Used='Yes', BuyerName=COALESCE(?, BuyerName) WHERE Code=?",
+                          (buyer_name, row["Code"]))
+            conn.commit()
+
+            return jsonify({
+                "valid": True,
+                "token": f"lic-{row['Code']}-{device_id}",
+                "expires_at": expiry.isoformat()+"Z",
+                "device_registered": True,
+                "reason": "ok_new_device"
+            }), 200
+
     except Exception:
-        count = 1
-    count = max(1, min(count, 60))
-    all_tickets = []
-    for _ in range(count):
-        for __ in range(6):
-            all_tickets.append(generate_ticket())
-    return jsonify({"cards": all_tickets})
-
-def generate_ticket():
-    ticket = [[0]*9 for _ in range(3)]
-    columns = [
-        list(range(1,10)), list(range(10,20)), list(range(20,30)),
-        list(range(30,40)), list(range(40,50)), list(range(50,60)),
-        list(range(60,70)), list(range(70,80)), list(range(80,91))
-    ]
-    for col in columns: random.shuffle(col)
-    row_cols = [random.sample(range(9), 5) for _ in range(3)]
-    for r in range(3):
-        for c in row_cols[r]:
-            ticket[r][c] = columns[c].pop()
-    for c in range(9):
-        vals = [ticket[r][c] for r in range(3) if ticket[r][c] != 0]
-        vals.sort()
-        i = 0
-        for r in range(3):
-            if ticket[r][c] != 0:
-                ticket[r][c] = vals[i]; i += 1
-    return ticket
-
-if __name__ == "__main__":
-    init_db()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+        traceback.print_exc()
+        return jsonify({"valid": False, "reason": "server_error"}), 500
 
