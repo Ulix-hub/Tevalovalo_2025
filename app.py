@@ -182,9 +182,10 @@ def validate():
             # Match regardless of hyphens/prefix in stored codes:
             # Compare normalized user input to REPLACE(Code,'-','')
             row = c.execute("""
-                SELECT Code, Used, BuyerName, Expiry, MaxDevices
-                FROM codes
-                WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
+            SELECT Code, Used, BuyerName, Expiry, MaxDevices
+            FROM codes
+            WHERE UPPER(REPLACE(Code,'-','')) =
+            UPPER(substr(?, -length(REPLACE(Code,'-',''))))
             """, (user_code,)).fetchone()
             if not row:
                 return jsonify({"valid": False, "reason": "not_found"}), 404
@@ -426,3 +427,4 @@ def generate_ticket():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
