@@ -29,6 +29,8 @@ def add_cors_headers(resp):
 DB_FILE = os.environ.get("DB_FILE", "codes.db")
 CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
 MAX_DEVICES_DEFAULT = int(os.environ.get("MAX_DEVICES_DEFAULT", "1"))
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+MASTER_CODE = os.environ.get("MASTER_CODE", "").strip()  # optional master bypass
 lock = Lock()
 
 # ===== Secure code alphabet + helpers (Base32 w/out 0/1/I/O) =====
@@ -47,7 +49,7 @@ def luhn_mod_n_check_index(values, n=ALPH_LEN):
 
 def make_secure_code(prefix="", groups=4, group_len=4, add_check=True):
     """
-    Display: TV-7XGM-Q2HN-8R3K-L  (L = check char)
+    Display form: TV-7XGM-Q2HN-8R3K-L  (L = check char)
     Returns (canonical_without_prefix_or_hyphens, display_with_prefix_and_hyphens)
     """
     payload_len = groups * group_len - (1 if add_check else 0)
@@ -58,7 +60,7 @@ def make_secure_code(prefix="", groups=4, group_len=4, add_check=True):
     chunks = [body[i:i+group_len] for i in range(0, len(body), group_len)]
     display = "-".join(chunks)
     display = f"{prefix.strip().upper()}-{display}" if prefix else display
-    canonical = re.sub(r"[^A-Z0-9]", "", display)  # strip hyphens
+    canonical = re.sub(r"[^A-Z0-9]", "", display)  # strip hyphens/prefix
     if prefix:
         canonical = canonical[len(prefix):]
     return canonical, display
@@ -73,7 +75,6 @@ def init_db():
     db_dir = os.path.dirname(DB_FILE)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("""
@@ -94,7 +95,7 @@ def init_db():
                 FOREIGN KEY (Code) REFERENCES codes(Code) ON DELETE CASCADE
             )
         """)
-        # Add MaxDevices if older DB lacked it
+        # Add MaxDevices if upgrading older DB
         try:
             c.execute("SELECT MaxDevices FROM codes LIMIT 1")
         except sqlite3.OperationalError:
@@ -130,7 +131,7 @@ def whoami():
     return jsonify({
         "service": os.environ.get("RENDER_SERVICE_NAME", "local"),
         "env": os.environ.get("RENDER_EXTERNAL_URL", "n/a"),
-        "version": "v5-validate-restored",
+        "version": "v6-secure-validate-single",
         "time": datetime.utcnow().isoformat() + "Z",
         "db_file": DB_FILE
     })
@@ -139,8 +140,9 @@ def whoami():
 def home():
     return "Access Code Validator & Housie90 API (Device-Bound) 🚀"
 
-# ---- VALIDATE (device-bound, monthly expiry supported) ----
-MASTER_CODE = os.environ.get("MASTER_CODE", "").strip()
+# ---- Helpers ----
+def _auth_ok(req):
+    return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
 
 def _get_max_devices(row):
     try:
@@ -148,8 +150,10 @@ def _get_max_devices(row):
     except Exception:
         return MAX_DEVICES_DEFAULT
 
-@app.route("/validate", methods=["POST", "GET"])
-def validate():
+# ---- VALIDATE (device-bound) ----
+@app.route("/validate", methods=["POST", "GET"], endpoint="validate_code")
+@app.route("/api/validate", methods=["POST", "GET"], endpoint="validate_code_alias")
+def validate_code():
     try:
         if request.method == "POST":
             data = request.get_json(silent=True) or {}
@@ -166,7 +170,7 @@ def validate():
         if not device_id:
             return jsonify({"valid": False, "reason": "missing_device_id"}), 400
 
-        # Master code (binds to device, very long expiry)
+        # Master code (binds to device; long expiry)
         if MASTER_CODE and user_code == normalize_code(MASTER_CODE):
             return jsonify({
                 "valid": True,
@@ -174,19 +178,19 @@ def validate():
                 "expires_at": (datetime.utcnow()+timedelta(days=3650)).isoformat()+"Z",
                 "device_registered": True,
                 "reason": "master"
-            })
+            }), 200
 
         with lock, sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            # Match regardless of hyphens/prefix in stored codes:
-            # Compare normalized user input to REPLACE(Code,'-','')
+            # Exact canonical match OR suffix match (so display codes w/ prefix work)
             row = c.execute("""
-            SELECT Code, Used, BuyerName, Expiry, MaxDevices
-            FROM codes
-            WHERE UPPER(REPLACE(Code,'-','')) =
-            UPPER(substr(?, -length(REPLACE(Code,'-',''))))
-            """, (user_code,)).fetchone()
+                SELECT Code, Used, BuyerName, Expiry, MaxDevices
+                FROM codes
+                WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
+                   OR UPPER(REPLACE(Code,'-','')) = UPPER(substr(?, -length(REPLACE(Code,'-',''))))
+                LIMIT 1
+            """, (user_code, user_code)).fetchone()
             if not row:
                 return jsonify({"valid": False, "reason": "not_found"}), 404
 
@@ -209,7 +213,7 @@ def validate():
                     "expires_at": expiry.isoformat()+"Z",
                     "device_registered": True,
                     "reason": "ok_same_device"
-                })
+                }), 200
 
             # Device limit
             cnt = c.execute("SELECT COUNT(*) FROM activations WHERE Code=?", (row["Code"],)).fetchone()[0]
@@ -217,7 +221,7 @@ def validate():
             if cnt >= max_devices:
                 return jsonify({"valid": False, "reason": "device_limit"}), 403
 
-            # Register device; mark used (legacy compat)
+            # Register device + mark used
             c.execute("INSERT OR IGNORE INTO activations (Code, DeviceID, FirstSeen) VALUES (?, ?, ?)",
                       (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
             if str(row["Used"] or "No").strip().lower() != "yes":
@@ -231,17 +235,11 @@ def validate():
                 "expires_at": expiry.isoformat()+"Z",
                 "device_registered": True,
                 "reason": "ok_new_device"
-            })
+            }), 200
 
     except Exception:
         traceback.print_exc()
         return jsonify({"valid": False, "reason": "server_error"}), 500
-
-# ---- ADMIN auth ----
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-
-def _auth_ok(req):
-    return ADMIN_KEY and req.headers.get("X-Admin-Key") == ADMIN_KEY
 
 # ---- ADMIN endpoints ----
 @app.post("/admin/add_code")
@@ -389,7 +387,7 @@ def admin_export_csv():
     csv_bytes = output.getvalue().encode("utf-8")
     return Response(csv_bytes, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=codes_export.csv"})
 
-# ---- Tickets ----
+# ---- Housie tickets (rule-compliant) ----
 @app.get("/api/tickets")
 def api_tickets():
     try:
@@ -397,40 +395,94 @@ def api_tickets():
     except Exception:
         count = 1
     count = max(1, min(count, 60))
-
     all_tickets = []
     for _ in range(count):
         for __ in range(6):
-            all_tickets.append(generate_ticket())
-
+            all_tickets.append(generate_ticket_strict())
     return jsonify({"cards": all_tickets})
 
-def generate_ticket():
-    import random
-    ticket = [[0]*9 for _ in range(3)]
-    columns = [
+def generate_ticket_strict():
+    """
+    Housie (Tambola) ticket:
+    - 3 rows, 9 columns
+    - exactly 15 numbers (5 per row)
+    - each column has 1–3 numbers
+    - numbers within a column strictly ascending top→bottom
+    - column ranges: 1–9, 10–19, ..., 80–90
+    """
+    # Column pools
+    cols = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
         list(range(60,70)), list(range(70,80)), list(range(80,91))
     ]
-    for col in columns:
-        random.shuffle(col)
+    for c in cols: random.shuffle(c)
 
-    # choose 5 cols per row
-    row_cols = [random.sample(range(9), 5) for _ in range(3)]
+    # Decide how many numbers in each column (1–3, total 15)
+    counts = [1]*9
+    extras = 15 - sum(counts)  # 6 to distribute
+    while extras > 0:
+        i = random.randrange(9)
+        if counts[i] < 3:
+            counts[i] += 1
+            extras -= 1
+
+    # Assign those counts into 3 rows so each row has exactly 5 cells
+    rows = [[0]*9 for _ in range(3)]
+    row_used = [0,0,0]
+
+    # First place columns with 3 → one in each row
+    for c_idx, cnt in enumerate(counts):
+        if cnt == 3:
+            for r in range(3):
+                rows[r][c_idx] = 1
+                row_used[r] += 1
+
+    # Then columns with 2 → pick two rows with lowest fill
+    for c_idx, cnt in enumerate(counts):
+        if cnt == 2:
+            options = sorted(range(3), key=lambda r: (row_used[r], random.random()))
+            for r in options:
+                if row_used[r] < 5:
+                    rows[r][c_idx] = 1
+                    row_used[r] += 1
+                    if sum(rows[r][c_idx] for r in range(3)) == 2:
+                        break
+
+    # Then columns with 1 → pick row with lowest fill
+    for c_idx, cnt in enumerate(counts):
+        if cnt == 1:
+            options = sorted(range(3), key=lambda r: (row_used[r], random.random()))
+            for r in options:
+                if row_used[r] < 5:
+                    rows[r][c_idx] = 1
+                    row_used[r] += 1
+                    break
+
+    # If any row is short (rare), patch by moving cells around safely
     for r in range(3):
-        for c in row_cols[r]:
-            ticket[r][c] = columns[c].pop()
+        while row_used[r] < 5:
+            # find a column where some other row has a 1 and moving preserves per-col <=3 and target row <=5
+            c_candidates = [c for c in range(9) if rows[r][c] == 0 and sum(rows[rr][c] for rr in range(3)) < 3]
+            if not c_candidates:
+                break
+            c_idx = random.choice(c_candidates)
+            rows[r][c_idx] = 1
+            row_used[r] += 1
 
-    # sort numbers within each column ascending (Housie rule)
-    for c in range(9):
-        vals = [ticket[r][c] for r in range(3) if ticket[r][c] != 0]
-        vals.sort()
-        i = 0
-        for r in range(3):
-            if ticket[r][c] != 0:
-                ticket[r][c] = vals[i]
-                i += 1
+    # Now populate numbers: for each column, pull as many numbers as rows marked 1
+    ticket = [[0]*9 for _ in range(3)]
+    for c_idx in range(9):
+        r_idxs = [r for r in range(3) if rows[r][c_idx] == 1]
+        need = len(r_idxs)
+        nums = sorted([cols[c_idx].pop() for _ in range(need)])  # ascending
+        # place smallest at top-most selected row, etc.
+        r_idxs.sort()
+        for k, r in enumerate(r_idxs):
+            ticket[r][c_idx] = nums[k]
 
     return ticket
 
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
