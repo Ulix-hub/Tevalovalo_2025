@@ -25,12 +25,12 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Device-Id"
     return resp
 
-# ---- DB ----
+# ---- DB/ENV ----
 DB_FILE = os.environ.get("DB_FILE", "codes.db")
 CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
 MAX_DEVICES_DEFAULT = int(os.environ.get("MAX_DEVICES_DEFAULT", "1"))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-MASTER_CODE = os.environ.get("MASTER_CODE", "").strip()  # optional master bypass
+MASTER_CODE = os.environ.get("MASTER_CODE", "").strip()
 lock = Lock()
 
 # ===== Secure code alphabet + helpers (Base32 w/out 0/1/I/O) =====
@@ -38,7 +38,6 @@ ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 symbols
 ALPH_LEN = len(ALPHABET)
 
 def luhn_mod_n_check_index(values, n=ALPH_LEN):
-    """Generalized Luhn mod N checksum index for a list of base-N digit indexes."""
     factor, total = 2, 0
     for v in reversed(values):
         addend = factor * v
@@ -49,8 +48,8 @@ def luhn_mod_n_check_index(values, n=ALPH_LEN):
 
 def make_secure_code(prefix="", groups=4, group_len=4, add_check=True):
     """
-    Display form: TV-7XGM-Q2HN-8R3K-L  (L = check char)
-    Returns (canonical_without_prefix_or_hyphens, display_with_prefix_and_hyphens)
+    Returns (canonical_without_prefix_or_hyphens, display_with_prefix)
+    Example display: TV-7XGM-Q2HN-8R3K-L   (last char is a check)
     """
     payload_len = groups * group_len - (1 if add_check else 0)
     vals = [secrets.randbelow(ALPH_LEN) for _ in range(payload_len)]
@@ -60,17 +59,28 @@ def make_secure_code(prefix="", groups=4, group_len=4, add_check=True):
     chunks = [body[i:i+group_len] for i in range(0, len(body), group_len)]
     display = "-".join(chunks)
     display = f"{prefix.strip().upper()}-{display}" if prefix else display
-    canonical = re.sub(r"[^A-Z0-9]", "", display)  # strip hyphens/prefix
+    canonical = re.sub(r"[^A-Z0-9]", "", display)
     if prefix:
         canonical = canonical[len(prefix):]
     return canonical, display
 
-# ===== Normalization =====
+# ===== Normalization / Canonicalization =====
+SECURE_BODY_LEN = 16  # length of the secure code body
+
 def normalize_code(s: str) -> str:
-    """Uppercase and strip ALL non-alphanumerics (hyphens/spaces removed)."""
     s = (s or "").strip().upper()
     return re.sub(r"[^A-Z0-9]", "", s)
 
+def to_canonical(code_str: str) -> str:
+    """
+    - Uppercase + remove non-alphanumerics
+    - If longer than 16, keep the LAST 16 chars (strips any prefix automatically)
+    Works for both display codes and raw canonical.
+    """
+    s = normalize_code(code_str)
+    return s[-SECURE_BODY_LEN:] if len(s) > SECURE_BODY_LEN else s
+
+# ---- DB init (with CSV UPSERT in canonical form) ----
 def init_db():
     db_dir = os.path.dirname(DB_FILE)
     if db_dir:
@@ -95,31 +105,39 @@ def init_db():
                 FOREIGN KEY (Code) REFERENCES codes(Code) ON DELETE CASCADE
             )
         """)
-        # Add MaxDevices if upgrading older DB
         try:
             c.execute("SELECT MaxDevices FROM codes LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE codes ADD COLUMN MaxDevices INTEGER DEFAULT 1")
         conn.commit()
 
-        # Optional seed from CSV (store canonical)
+        # Seed/refresh from CSV (UPSERT), storing canonical Code
         if os.path.exists(CSV_FILE):
             with open(CSV_FILE, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     raw_code = row.get("Code")
-                    code = normalize_code(raw_code)
+                    code = to_canonical(raw_code)
                     if not code:
                         continue
                     used   = (row.get("Used") or "No").strip()
                     buyer  = (row.get("BuyerName") or "").strip()
                     expiry = (row.get("Expiry") or "").strip()
-                    maxdev = int((row.get("MaxDevices") or MAX_DEVICES_DEFAULT) or 1)
+                    try:
+                        maxdev = int((row.get("MaxDevices") or MAX_DEVICES_DEFAULT) or 1)
+                    except Exception:
+                        maxdev = MAX_DEVICES_DEFAULT
                     if not expiry:
                         expiry = (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z"
+
                     c.execute("""
-                        INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
+                        INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                         VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(Code) DO UPDATE SET
+                          Used       = excluded.Used,
+                          BuyerName  = excluded.BuyerName,
+                          Expiry     = excluded.Expiry,
+                          MaxDevices = excluded.MaxDevices
                     """, (code, used, buyer, expiry, maxdev))
             conn.commit()
 
@@ -131,7 +149,7 @@ def whoami():
     return jsonify({
         "service": os.environ.get("RENDER_SERVICE_NAME", "local"),
         "env": os.environ.get("RENDER_EXTERNAL_URL", "n/a"),
-        "version": "v6-secure-validate-single",
+        "version": "v7-canonical-upsert",
         "time": datetime.utcnow().isoformat() + "Z",
         "db_file": DB_FILE
     })
@@ -150,28 +168,30 @@ def _get_max_devices(row):
     except Exception:
         return MAX_DEVICES_DEFAULT
 
-# ---- VALIDATE (device-bound) ----
-@app.route("/validate", methods=["POST", "GET"], endpoint="validate_code")
-@app.route("/api/validate", methods=["POST", "GET"], endpoint="validate_code_alias")
-def validate_code():
+# ---- VALIDATE (device-bound; single implementation, two paths) ----
+@app.route("/validate", methods=["POST", "GET"])
+@app.route("/api/validate", methods=["POST", "GET"])
+def validate():
     try:
         if request.method == "POST":
             data = request.get_json(silent=True) or {}
-            user_code = normalize_code(data.get("code"))
-            buyer_name = (data.get("buyer") or "").strip()
+            raw_code  = data.get("code")
+            buyer     = (data.get("buyer") or "").strip()
             device_id = (data.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
         else:
-            user_code = normalize_code(request.args.get("code"))
-            buyer_name = (request.args.get("buyer") or "").strip()
+            raw_code  = request.args.get("code")
+            buyer     = (request.args.get("buyer") or "").strip()
             device_id = (request.args.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
 
-        if not user_code:
-            return jsonify({"valid": False, "reason": "empty_code"}), 400
+        code = to_canonical(raw_code)
+
+        if not code:
+            return jsonify({"valid": False, "reason": "empty_code"}), 404
         if not device_id:
             return jsonify({"valid": False, "reason": "missing_device_id"}), 400
 
         # Master code (binds to device; long expiry)
-        if MASTER_CODE and user_code == normalize_code(MASTER_CODE):
+        if MASTER_CODE and code == to_canonical(MASTER_CODE):
             return jsonify({
                 "valid": True,
                 "token": f"master-{device_id}",
@@ -183,14 +203,14 @@ def validate_code():
         with lock, sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            # Exact canonical match OR suffix match (so display codes w/ prefix work)
+
+            # Exact canonical match
             row = c.execute("""
                 SELECT Code, Used, BuyerName, Expiry, MaxDevices
                 FROM codes
                 WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
-                   OR UPPER(REPLACE(Code,'-','')) = UPPER(substr(?, -length(REPLACE(Code,'-',''))))
                 LIMIT 1
-            """, (user_code, user_code)).fetchone()
+            """, (code,)).fetchone()
             if not row:
                 return jsonify({"valid": False, "reason": "not_found"}), 404
 
@@ -203,7 +223,7 @@ def validate_code():
             if expiry <= datetime.utcnow():
                 return jsonify({"valid": False, "reason": "expired"}), 400
 
-            # Already this device?
+            # Already activated on this device?
             already = c.execute("SELECT 1 FROM activations WHERE Code=? AND DeviceID=?",
                                 (row["Code"], device_id)).fetchone()
             if already:
@@ -226,7 +246,7 @@ def validate_code():
                       (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
             if str(row["Used"] or "No").strip().lower() != "yes":
                 c.execute("UPDATE codes SET Used='Yes', BuyerName=COALESCE(?, BuyerName) WHERE Code=?",
-                          (buyer_name, row["Code"]))
+                          (buyer, row["Code"]))
             conn.commit()
 
             return jsonify({
@@ -246,7 +266,7 @@ def validate_code():
 def admin_add_code():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
     data = request.get_json(silent=True) or {}
-    code = normalize_code(data.get("code"))
+    code = to_canonical(data.get("code"))
     buyer = (data.get("buyer") or "").strip()
     days = int(data.get("days") or 30)
     max_devices = int(data.get("max_devices") or MAX_DEVICES_DEFAULT)
@@ -264,7 +284,7 @@ def admin_add_code():
         conn.commit()
     return jsonify({"ok": True, "code": code, "expiry": expiry, "max_devices": max_devices})
 
-@app.post("/admin/new_codes")  # legacy simple codes (kept for compat)
+@app.post("/admin/new_codes")  # legacy simple codes (now stored canonical)
 def admin_new_codes():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
     n      = int(request.args.get("n", 10))
@@ -282,12 +302,13 @@ def admin_new_codes():
     with lock, sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         for _ in range(n):
-            code = _make_code(prefix)
+            raw = _make_code(prefix)
+            code = to_canonical(raw)
             c.execute("""
                 INSERT OR IGNORE INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                 VALUES (?, 'No', ?, ?, ?)
             """, (code, buyer, expiry, max_devices))
-            made.append(code)
+            made.append(raw)
         conn.commit()
     return jsonify({"ok": True, "count": len(made), "expiry": expiry, "max_devices": max_devices, "codes": made})
 
@@ -345,7 +366,7 @@ def admin_reset_code():
     data = request.get_json(silent=True) or {}
     raw = data.get("code")
     if not raw: return jsonify({"ok": False, "error": "missing_code"}), 400
-    norm = normalize_code(raw)
+    norm = to_canonical(raw)
     with lock, sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("UPDATE codes SET Used='No' WHERE UPPER(REPLACE(Code,'-',''))=UPPER(?)", (norm,))
@@ -387,7 +408,7 @@ def admin_export_csv():
     csv_bytes = output.getvalue().encode("utf-8")
     return Response(csv_bytes, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=codes_export.csv"})
 
-# ---- Housie tickets (rule-compliant) ----
+# ---- Tickets (strict) ----
 @app.get("/api/tickets")
 def api_tickets():
     try:
@@ -402,15 +423,6 @@ def api_tickets():
     return jsonify({"cards": all_tickets})
 
 def generate_ticket_strict():
-    """
-    Housie (Tambola) ticket:
-    - 3 rows, 9 columns
-    - exactly 15 numbers (5 per row)
-    - each column has 1–3 numbers
-    - numbers within a column strictly ascending top→bottom
-    - column ranges: 1–9, 10–19, ..., 80–90
-    """
-    # Column pools
     cols = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
@@ -418,7 +430,6 @@ def generate_ticket_strict():
     ]
     for c in cols: random.shuffle(c)
 
-    # Decide how many numbers in each column (1–3, total 15)
     counts = [1]*9
     extras = 15 - sum(counts)  # 6 to distribute
     while extras > 0:
@@ -427,156 +438,58 @@ def generate_ticket_strict():
             counts[i] += 1
             extras -= 1
 
-    # Assign those counts into 3 rows so each row has exactly 5 cells
     rows = [[0]*9 for _ in range(3)]
     row_used = [0,0,0]
 
-    # First place columns with 3 → one in each row
-    for c_idx, cnt in enumerate(counts):
+    # place columns with 3
+    for ci, cnt in enumerate(counts):
         if cnt == 3:
             for r in range(3):
-                rows[r][c_idx] = 1
+                rows[r][ci] = 1
                 row_used[r] += 1
 
-    # Then columns with 2 → pick two rows with lowest fill
-    for c_idx, cnt in enumerate(counts):
+    # columns with 2
+    for ci, cnt in enumerate(counts):
         if cnt == 2:
             options = sorted(range(3), key=lambda r: (row_used[r], random.random()))
+            placed = 0
             for r in options:
                 if row_used[r] < 5:
-                    rows[r][c_idx] = 1
+                    rows[r][ci] = 1
                     row_used[r] += 1
-                    if sum(rows[r][c_idx] for r in range(3)) == 2:
-                        break
+                    placed += 1
+                    if placed == 2: break
 
-    # Then columns with 1 → pick row with lowest fill
-    for c_idx, cnt in enumerate(counts):
+    # columns with 1
+    for ci, cnt in enumerate(counts):
         if cnt == 1:
             options = sorted(range(3), key=lambda r: (row_used[r], random.random()))
             for r in options:
                 if row_used[r] < 5:
-                    rows[r][c_idx] = 1
+                    rows[r][ci] = 1
                     row_used[r] += 1
                     break
 
-    # If any row is short (rare), patch by moving cells around safely
+    # patch any short row
     for r in range(3):
         while row_used[r] < 5:
-            # find a column where some other row has a 1 and moving preserves per-col <=3 and target row <=5
-            c_candidates = [c for c in range(9) if rows[r][c] == 0 and sum(rows[rr][c] for rr in range(3)) < 3]
-            if not c_candidates:
+            cands = [ci for ci in range(9) if rows[r][ci] == 0 and sum(rows[rr][ci] for rr in range(3)) < 3]
+            if not cands:
                 break
-            c_idx = random.choice(c_candidates)
-            rows[r][c_idx] = 1
+            ci = random.choice(cands)
+            rows[r][ci] = 1
             row_used[r] += 1
 
-    # Now populate numbers: for each column, pull as many numbers as rows marked 1
     ticket = [[0]*9 for _ in range(3)]
-    for c_idx in range(9):
-        r_idxs = [r for r in range(3) if rows[r][c_idx] == 1]
+    for ci in range(9):
+        r_idxs = [r for r in range(3) if rows[r][ci] == 1]
         need = len(r_idxs)
-        nums = sorted([cols[c_idx].pop() for _ in range(need)])  # ascending
-        # place smallest at top-most selected row, etc.
+        nums = sorted([cols[ci].pop() for _ in range(need)])
         r_idxs.sort()
         for k, r in enumerate(r_idxs):
-            ticket[r][c_idx] = nums[k]
-
+            ticket[r][ci] = nums[k]
     return ticket
-# ---- VALIDATE (single definition; works with secure display codes + device binding) ----
-@app.route("/validate", methods=["POST", "GET"])
-def validate_v6():
-    try:
-        # read either JSON body (POST) or query string (GET)
-        if request.method == "POST":
-            data = request.get_json(silent=True) or {}
-            user_code = normalize_code(data.get("code"))
-            buyer_name = (data.get("buyer") or "").strip()
-            device_id = (data.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
-        else:
-            user_code = normalize_code(request.args.get("code"))
-            buyer_name = (request.args.get("buyer") or "").strip()
-            device_id = (request.args.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
-
-        if not user_code:
-            return jsonify({"valid": False, "reason": "empty_code"}), 200
-        if not device_id:
-            return jsonify({"valid": False, "reason": "missing_device_id"}), 200
-
-        # Optional master code
-        if MASTER_CODE and user_code == normalize_code(MASTER_CODE):
-            return jsonify({
-                "valid": True,
-                "token": f"master-{device_id}",
-                "expires_at": (datetime.utcnow()+timedelta(days=3650)).isoformat()+"Z",
-                "device_registered": True,
-                "reason": "master"
-            }), 200
-
-        with lock, sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-
-            # Stored codes are canonical (no hyphens, usually no prefix).
-            # Match the TAIL of user input (after removing hyphens/prefix) against stored canonical.
-            row = c.execute("""
-                SELECT Code, Used, BuyerName, Expiry, MaxDevices
-                FROM codes
-                WHERE UPPER(REPLACE(Code,'-','')) =
-                      UPPER(substr(?, -length(REPLACE(Code,'-',''))))
-            """, (user_code,)).fetchone()
-
-            if not row:
-                return jsonify({"valid": False, "reason": "not_found"}), 200
-
-            # Expiry
-            expiry_str = row["Expiry"]
-            try:
-                expiry = datetime.fromisoformat((expiry_str or "").replace("Z","")) if expiry_str else (datetime.utcnow() + timedelta(days=30))
-            except Exception:
-                expiry = datetime.utcnow() + timedelta(days=30)
-            if expiry <= datetime.utcnow():
-                return jsonify({"valid": False, "reason": "expired"}), 200
-
-            # Already activated on this device?
-            already = c.execute("SELECT 1 FROM activations WHERE Code=? AND DeviceID=?",
-                                (row["Code"], device_id)).fetchone()
-            if already:
-                return jsonify({
-                    "valid": True,
-                    "token": f"lic-{row['Code']}-{device_id}",
-                    "expires_at": expiry.isoformat()+"Z",
-                    "device_registered": True,
-                    "reason": "ok_same_device"
-                }), 200
-
-            # Device limit
-            cnt = c.execute("SELECT COUNT(*) FROM activations WHERE Code=?", (row["Code"],)).fetchone()[0]
-            max_devices = int(row["MaxDevices"])
-            if cnt >= max_devices:
-                # return 200 so PowerShell can read JSON without throwing
-                return jsonify({"valid": False, "reason": "device_limit"}), 200
-
-            # Register device + mark used
-            c.execute("INSERT OR IGNORE INTO activations (Code, DeviceID, FirstSeen) VALUES (?, ?, ?)",
-                      (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
-            if str(row["Used"] or "No").strip().lower() != "yes":
-                c.execute("UPDATE codes SET Used='Yes', BuyerName=COALESCE(?, BuyerName) WHERE Code=?",
-                          (buyer_name, row["Code"]))
-            conn.commit()
-
-            return jsonify({
-                "valid": True,
-                "token": f"lic-{row['Code']}-{device_id}",
-                "expires_at": expiry.isoformat()+"Z",
-                "device_registered": True,
-                "reason": "ok_new_device"
-            }), 200
-
-    except Exception:
-        traceback.print_exc()
-        return jsonify({"valid": False, "reason": "server_error"}), 500
 
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
