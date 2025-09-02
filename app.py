@@ -311,7 +311,50 @@ def admin_new_codes():
             made.append(raw)
         conn.commit()
     return jsonify({"ok": True, "count": len(made), "expiry": expiry, "max_devices": max_devices, "codes": made})
+@app.post("/admin/bulk_add")
+def admin_bulk_add():
+    if not _auth_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
 
+    data = request.get_json(silent=True) or {}
+    raw_codes    = data.get("codes") or []
+    buyer        = (data.get("buyer") or "").strip()
+    days         = int(data.get("days") or 30)
+    max_devices  = int(data.get("max_devices") or MAX_DEVICES_DEFAULT)
+
+    if not isinstance(raw_codes, list) or not raw_codes:
+        return jsonify({"ok": False, "error": "no_codes"}), 400
+
+    expiry = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+
+    added, skipped = [], []
+    with lock, sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        for raw in raw_codes:
+            try:
+                code = to_canonical(raw)
+                if not code:
+                    skipped.append({"raw": raw, "reason": "empty"})
+                    continue
+                c.execute("""
+                    INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
+                    VALUES (?, 'No', ?, ?, ?)
+                    ON CONFLICT(Code) DO UPDATE SET
+                        Used='No', BuyerName=excluded.BuyerName,
+                        Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
+                """, (code, buyer, expiry, max_devices))
+                added.append(code)
+            except Exception as e:
+                skipped.append({"raw": raw, "reason": str(e)})
+        conn.commit()
+
+    return jsonify({
+        "ok": True,
+        "added": len(added),
+        "skipped": skipped,
+        "expiry": expiry,
+        "max_devices": max_devices
+    })
 @app.route("/admin/new_codes_secure", methods=["POST", "GET"])
 def admin_new_codes_secure():
     if not _auth_ok(request): return jsonify({"ok": False, "error": "unauthorized"}), 403
@@ -493,3 +536,4 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
