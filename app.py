@@ -71,24 +71,24 @@ def normalize_code(s: str) -> str:
     s = (s or "").strip().upper()
     return re.sub(r"[^A-Z0-9]", "", s)
 
-SECURE_BODY_LEN = 16  # keep as-is
+SECURE_BODY_LEN = 16  # keep
+
 def to_canonical(code_str: str) -> str:
     """
-    - If original string starts with a short LETTER prefix followed by '-', drop just that prefix.
-      e.g. 'TV-ASAG-V4YG-2S2E' -> 'ASAG-V4YG-2S2E'
-    - Uppercase + strip non-alphanumerics
-    - If longer than 16, keep the LAST 16 chars; otherwise keep full (so 3x4 stays 12 chars)
+    Accepts DISPLAY or raw. If the code has a short letter prefix like 'TV-',
+    drop just that prefix, then uppercase, strip non-alphanumerics.
+    If longer than 16, keep LAST 16; else keep as-is (so 3x4=12 stays 12).
     """
     raw = (code_str or "").strip()
     if not raw:
         return ""
+    # If it looks like PREFIX-xxxx..., drop only the first segment if it's letters
     if "-" in raw:
         first, *rest = raw.split("-")
         if first.isalpha() and 1 <= len(first) <= 4:
             raw = "-".join(rest)
     s = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
     return s[-SECURE_BODY_LEN:] if len(s) > SECURE_BODY_LEN else s
-
 
 # ---- DB init (with CSV UPSERT in canonical form) ----
 def init_db():
@@ -194,6 +194,7 @@ def validate():
             device_id = (request.args.get("device_id") or "").strip() or (request.headers.get("X-Device-Id") or "").strip()
 
         code = to_canonical(raw_code)
+        raw_norm = normalize_code(raw_code)
 
         if not code:
             return jsonify({"valid": False, "reason": "empty_code"}), 404
@@ -219,7 +220,7 @@ def validate():
             SELECT Code, Used, BuyerName, Expiry, MaxDevices
             FROM codes
             WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
-           OR UPPER(REPLACE(Code,'-','')) = UPPER(substr(?, -length(REPLACE(Code,'-',''))))
+            OR UPPER(REPLACE(Code,'-','')) = UPPER(substr(?, -length(REPLACE(Code,'-',''))))
             LIMIT 1
             """, (code, raw_norm)).fetchone()
 
@@ -550,6 +551,7 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
