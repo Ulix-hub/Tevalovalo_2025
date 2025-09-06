@@ -71,13 +71,20 @@ def normalize_code(s: str) -> str:
     s = (s or "").strip().upper()
     return re.sub(r"[^A-Z0-9]", "", s)
 
+SECURE_BODY_LEN = 16  # keep 16; works fine for 8/12/16-char bodies
+
 def to_canonical(code_str: str) -> str:
     """
     - Uppercase + remove non-alphanumerics
-    - If longer than 16, keep the LAST 16 chars (strips any prefix automatically)
-    Works for both display codes and raw canonical.
+    - Drop any leading letter prefix (e.g., TV, A, B...)
+    - If longer than 16, keep the LAST 16 chars (so older 4x4/3x4 bodies still match)
     """
     s = normalize_code(code_str)
+    # remove any leading letters (prefix)
+    i = 0
+    while i < len(s) and s[i].isalpha():
+        i += 1
+    s = s[i:] if i else s
     return s[-SECURE_BODY_LEN:] if len(s) > SECURE_BODY_LEN else s
 
 # ---- DB init (with CSV UPSERT in canonical form) ----
@@ -206,11 +213,13 @@ def validate():
 
             # Exact canonical match
             row = c.execute("""
-                SELECT Code, Used, BuyerName, Expiry, MaxDevices
-                FROM codes
-                WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
-                LIMIT 1
-            """, (code,)).fetchone()
+            SELECT Code, Used, BuyerName, Expiry, MaxDevices
+            FROM codes
+            WHERE UPPER(REPLACE(Code,'-','')) = UPPER(?)
+           OR UPPER(REPLACE(Code,'-','')) = UPPER(substr(?, -length(REPLACE(Code,'-',''))))
+            LIMIT 1
+            """, (code, raw_norm)).fetchone()
+
             if not row:
                 return jsonify({"valid": False, "reason": "not_found"}), 404
 
@@ -333,6 +342,8 @@ def admin_bulk_add():
         for raw in raw_codes:
             try:
                 code = to_canonical(raw)
+                raw_norm = normalize_code(raw_code)
+
                 if not code:
                     skipped.append({"raw": raw, "reason": "empty"})
                     continue
@@ -536,4 +547,5 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
