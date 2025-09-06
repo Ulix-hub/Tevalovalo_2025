@@ -73,19 +73,27 @@ def normalize_code(s: str) -> str:
 
 SECURE_BODY_LEN = 16  # keep 16; works fine for 8/12/16-char bodies
 
+SECURE_BODY_LEN = 16  # unchanged
+
 def to_canonical(code_str: str) -> str:
     """
+    - If it looks like PREFIX-..., where PREFIX is 1–4 letters, drop just that first chunk.
+      (e.g., TV-ASAG-V4YG-2S2E -> ASAG-V4YG-2S2E)
     - Uppercase + remove non-alphanumerics
-    - Drop any leading letter prefix (e.g., TV, A, B...)
-    - If longer than 16, keep the LAST 16 chars (so older 4x4/3x4 bodies still match)
+    - If longer than 16, keep the LAST 16 chars (works for 4x4 bodies; shorter bodies like 3x4 stay as-is)
     """
-    s = normalize_code(code_str)
-    # remove any leading letters (prefix)
-    i = 0
-    while i < len(s) and s[i].isalpha():
-        i += 1
-    s = s[i:] if i else s
+    raw = (code_str or "").strip()
+    if not raw:
+        return ""
+    # Strip a short letter prefix only if the ORIGINAL string uses a leading "LETTERS-"
+    if "-" in raw:
+        first, *rest = raw.split("-")
+        if first.isalpha() and 1 <= len(first) <= 4:
+            raw = "".join(rest)          # join the remaining chunks; we'll clean hyphens shortly
+
+    s = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
     return s[-SECURE_BODY_LEN:] if len(s) > SECURE_BODY_LEN else s
+
 
 # ---- DB init (with CSV UPSERT in canonical form) ----
 def init_db():
@@ -547,5 +555,6 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
