@@ -481,15 +481,7 @@ def api_tickets():
     return jsonify({"cards": all_tickets})
 
 def generate_ticket_strict():
-    """
-    Balanced generator:
-    - 3x9 ticket, 5 numbers per row (total 15)
-    - Column ranges are fixed (1–9, 10–19, …, 80–90)
-    - Even visual spread: each 3-column block (0–2, 3–5, 6–8) gets exactly 5 numbers.
-      Two blocks use (3,1,1) distribution; one block uses (2,2,1).
-    - Rows are assigned greedily to end with exactly 5 each.
-    """
-    # --- Column ranges (fixed for Tambola/Housie90) ---
+    # 9 columns: 1–9, 10–19, …, 80–90
     cols = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
@@ -498,163 +490,129 @@ def generate_ticket_strict():
     for c in cols:
         random.shuffle(c)
 
-    # --- Decide counts per column, balanced by thirds (blocks of 3 columns) ---
-    # We have 9 columns split into blocks: [0..2], [3..5], [6..8]
-    # Each block must total 5 numbers. Pattern: two blocks = (3,1,1), one block = (2,2,1).
-    counts = [1] * 9  # start with 1 everywhere
-    blocks = [0, 1, 2]
-    random.shuffle(blocks)
-    three_blocks = blocks[:2]  # two blocks that will get a single +2 (i.e., 3,1,1)
+    # --- balanced per-column counts (sum=15, each 1..3), center-out spread ---
+    counts = [1] * 9
+    extras = 15 - sum(counts)  # 6 to distribute
+    order = [4, 3, 5, 2, 6, 1, 7, 0, 8]  # center -> edges
 
-    for b in range(3):
-        c0, c1, c2 = 3*b, 3*b+1, 3*b+2
-        if b in three_blocks:
-            # (3,1,1): pick one of the three columns to add +2
-            j = random.choice([c0, c1, c2])
-            counts[j] += 2
-        else:
-            # (2,2,1): pick two different columns to add +1
-            j1, j2 = random.sample([c0, c1, c2], 2)
-            counts[j1] += 1
-            counts[j2] += 1
-    # total is now 15
-
-    # --- Assign which rows get filled in each column (each row must end at 5) ---
-    # Try a few times to avoid rare dead ends.
-    for _attempt in range(40):
-        rows = [[0]*9 for _ in range(3)]
-        row_used = [0, 0, 0]
-        ok = True
-
-        # Place columns in helpful order: 3's, then 2's, then 1's
-        order = sorted(range(9), key=lambda i: (-counts[i], i))
-
-        for ci in order:
-            need = counts[ci]
-            if need == 3:
-                # all rows
-                for r in range(3):
-                    rows[r][ci] = 1
-                    row_used[r] += 1
-            elif need == 2:
-                # pick two least-used rows (tie-break randomly)
-                for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
-                    if rows[r][ci] == 0 and row_used[r] < 5:
-                        rows[r][ci] = 1
-                        row_used[r] += 1
-                        if sum(rows[rr][ci] for rr in range(3)) == 2:
-                            break
-                if sum(rows[rr][ci] for rr in range(3)) != 2:
-                    ok = False
-                    break
-            else:  # need == 1
-                placed = False
-                for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
-                    if rows[r][ci] == 0 and row_used[r] < 5:
-                        rows[r][ci] = 1
-                        row_used[r] += 1
-                        placed = True
-                        break
-                if not placed:
-                    ok = False
-                    break
-
-        if not ok:
-            continue
-
-        # Top up any row under 5 by borrowing from columns that still have capacity (per counts)
-        for r in range(3):
-            while row_used[r] < 5:
-                candidates = [ci for ci in range(9)
-                              if rows[r][ci] == 0 and sum(rows[rr][ci] for rr in range(3)) < counts[ci]]
-                if not candidates:
-                    ok = False
-                    break
-                ci = random.choice(candidates)
-                rows[r][ci] = 1
-                row_used[r] += 1
-            if not ok:
+    idx = 0
+    while extras > 0:
+        # find next column in center-out order that can still take +1 (max 3)
+        for _ in range(9):
+            ci = order[idx % 9]
+            idx += 1
+            if counts[ci] < 3:
+                counts[ci] += 1
+                extras -= 1
                 break
 
-        # Validate: rows are 5 each, and column sums match counts
-        if ok and row_used == [5, 5, 5] and all(sum(rows[r][ci] for r in range(3)) == counts[ci] for ci in range(9)):
-            break
-    else:
-        # Extremely rare fallback: evenly distribute per old approach
-        # (kept for robustness; you can remove this if you prefer a hard failure)
-        return _fallback_generate_ticket(cols)
-
-    # --- Fill numbers into the chosen cells; ascending within each column top→bottom ---
-    ticket = [[0]*9 for _ in range(3)]
-    for ci in range(9):
-        k = counts[ci]
-        nums = sorted([cols[ci].pop() for _ in range(k)])
-        r_idxs = [r for r in range(3) if rows[r][ci] == 1]
-        r_idxs.sort()  # top to bottom
-        for idx, r in enumerate(r_idxs):
-            ticket[r][ci] = nums[idx]
-
-    return ticket
-
-
-def _fallback_generate_ticket(cols):
-    """Very close to your original logic; used only if balancing fails (rare)."""
-    counts = [1]*9
-    extras = 6
-    while extras > 0:
-        i = random.randrange(9)
-        if counts[i] < 3:
-            counts[i] += 1
-            extras -= 1
-
-    rows = [[0]*9 for _ in range(3)]
+    # rows[r][ci] = 1 means a number will appear there
+    rows = [[0] * 9 for _ in range(3)]
     row_used = [0, 0, 0]
 
+    thirds = [(0, 2), (3, 5), (6, 8)]
+    def third_idx(ci):
+        return 0 if ci <= 2 else (1 if ci <= 5 else 2)
+
+    # coverage[r][t] = 1 if row r already has a number in third t
+    coverage = [[0, 0, 0] for _ in range(3)]
+
+    # 3-per-column: one in each row
     for ci, cnt in enumerate(counts):
         if cnt == 3:
             for r in range(3):
                 rows[r][ci] = 1
                 row_used[r] += 1
+                coverage[r][third_idx(ci)] = 1
 
+    # 2-per-column: pick two rows with fewest used; prefer rows that still lack this third
     for ci, cnt in enumerate(counts):
         if cnt == 2:
-            for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
+            t = third_idx(ci)
+            options = sorted(
+                range(3),
+                key=lambda r: (row_used[r], coverage[r][t], random.random())
+            )
+            placed = 0
+            for r in options:
                 if row_used[r] < 5:
                     rows[r][ci] = 1
                     row_used[r] += 1
-                    if sum(rows[rr][ci] for rr in range(3)) == 2:
+                    coverage[r][t] = 1
+                    placed += 1
+                    if placed == 2:
                         break
+            # Fallback if something weird happens
+            if placed < 2:
+                for r in range(3):
+                    if placed == 2:
+                        break
+                    if rows[r][ci] == 0 and row_used[r] < 5:
+                        rows[r][ci] = 1
+                        row_used[r] += 1
+                        coverage[r][t] = 1
+                        placed += 1
 
+    # 1-per-column: pick the row that still needs this third, then fewest used
     for ci, cnt in enumerate(counts):
         if cnt == 1:
-            for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
+            t = third_idx(ci)
+            options = sorted(
+                range(3),
+                key=lambda r: (coverage[r][t], row_used[r], random.random())
+            )
+            chosen = None
+            for r in options:
                 if row_used[r] < 5:
-                    rows[r][ci] = 1
-                    row_used[r] += 1
+                    chosen = r
                     break
+            if chosen is None:
+                # final fallback: any row with capacity, else the smallest
+                caps = [r for r in range(3) if row_used[r] < 5]
+                chosen = random.choice(caps) if caps else min(range(3), key=lambda r: row_used[r])
+            rows[chosen][ci] = 1
+            row_used[chosen] += 1
+            coverage[chosen][t] = 1
 
+    # Light patching: if any row <5 (rare), borrow from the row with most cells
     for r in range(3):
         while row_used[r] < 5:
-            cands = [ci for ci in range(9) if rows[r][ci] == 0 and sum(rows[rr][ci] for rr in range(3)) < 3]
-            if not cands:
+            donor = max(range(3), key=lambda rr: row_used[rr])
+            if row_used[donor] <= 5:
                 break
-            ci = random.choice(cands)
+            # Move a column where donor has a 1 and receiver has 0
+            movable = [ci for ci in range(9) if rows[donor][ci] == 1 and rows[r][ci] == 0]
+            if not movable:
+                break
+            ci = random.choice(movable)
+            rows[donor][ci] = 0
+            row_used[donor] -= 1
             rows[r][ci] = 1
             row_used[r] += 1
+            # refresh coverage
+            coverage = [[0, 0, 0] for _ in range(3)]
+            for rr in range(3):
+                for cidx in range(9):
+                    if rows[rr][cidx]:
+                        coverage[rr][third_idx(cidx)] = 1
 
-    ticket = [[0]*9 for _ in range(3)]
+    # --- assign actual numbers: ascending down each column ---
+    ticket = [[0] * 9 for _ in range(3)]
     for ci in range(9):
-        need = sum(rows[r][ci] for r in range(3))
-        nums = sorted([cols[ci].pop() for _ in range(need)])
         r_idxs = [r for r in range(3) if rows[r][ci] == 1]
+        need = len(r_idxs)
+        nums = sorted([cols[ci].pop() for _ in range(need)])
         r_idxs.sort()
         for k, r in enumerate(r_idxs):
             ticket[r][ci] = nums[k]
+
     return ticket
+
 
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
