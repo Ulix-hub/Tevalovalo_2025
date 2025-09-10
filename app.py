@@ -481,15 +481,126 @@ def api_tickets():
     return jsonify({"cards": all_tickets})
 
 def generate_ticket_strict():
+    """
+    Balanced generator:
+    - 3x9 ticket, 5 numbers per row (total 15)
+    - Column ranges are fixed (1–9, 10–19, …, 80–90)
+    - Even visual spread: each 3-column block (0–2, 3–5, 6–8) gets exactly 5 numbers.
+      Two blocks use (3,1,1) distribution; one block uses (2,2,1).
+    - Rows are assigned greedily to end with exactly 5 each.
+    """
+    # --- Column ranges (fixed for Tambola/Housie90) ---
     cols = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
         list(range(60,70)), list(range(70,80)), list(range(80,91))
     ]
-    for c in cols: random.shuffle(c)
+    for c in cols:
+        random.shuffle(c)
 
+    # --- Decide counts per column, balanced by thirds (blocks of 3 columns) ---
+    # We have 9 columns split into blocks: [0..2], [3..5], [6..8]
+    # Each block must total 5 numbers. Pattern: two blocks = (3,1,1), one block = (2,2,1).
+    counts = [1] * 9  # start with 1 everywhere
+    blocks = [0, 1, 2]
+    random.shuffle(blocks)
+    three_blocks = blocks[:2]  # two blocks that will get a single +2 (i.e., 3,1,1)
+
+    for b in range(3):
+        c0, c1, c2 = 3*b, 3*b+1, 3*b+2
+        if b in three_blocks:
+            # (3,1,1): pick one of the three columns to add +2
+            j = random.choice([c0, c1, c2])
+            counts[j] += 2
+        else:
+            # (2,2,1): pick two different columns to add +1
+            j1, j2 = random.sample([c0, c1, c2], 2)
+            counts[j1] += 1
+            counts[j2] += 1
+    # total is now 15
+
+    # --- Assign which rows get filled in each column (each row must end at 5) ---
+    # Try a few times to avoid rare dead ends.
+    for _attempt in range(40):
+        rows = [[0]*9 for _ in range(3)]
+        row_used = [0, 0, 0]
+        ok = True
+
+        # Place columns in helpful order: 3's, then 2's, then 1's
+        order = sorted(range(9), key=lambda i: (-counts[i], i))
+
+        for ci in order:
+            need = counts[ci]
+            if need == 3:
+                # all rows
+                for r in range(3):
+                    rows[r][ci] = 1
+                    row_used[r] += 1
+            elif need == 2:
+                # pick two least-used rows (tie-break randomly)
+                for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
+                    if rows[r][ci] == 0 and row_used[r] < 5:
+                        rows[r][ci] = 1
+                        row_used[r] += 1
+                        if sum(rows[rr][ci] for rr in range(3)) == 2:
+                            break
+                if sum(rows[rr][ci] for rr in range(3)) != 2:
+                    ok = False
+                    break
+            else:  # need == 1
+                placed = False
+                for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
+                    if rows[r][ci] == 0 and row_used[r] < 5:
+                        rows[r][ci] = 1
+                        row_used[r] += 1
+                        placed = True
+                        break
+                if not placed:
+                    ok = False
+                    break
+
+        if not ok:
+            continue
+
+        # Top up any row under 5 by borrowing from columns that still have capacity (per counts)
+        for r in range(3):
+            while row_used[r] < 5:
+                candidates = [ci for ci in range(9)
+                              if rows[r][ci] == 0 and sum(rows[rr][ci] for rr in range(3)) < counts[ci]]
+                if not candidates:
+                    ok = False
+                    break
+                ci = random.choice(candidates)
+                rows[r][ci] = 1
+                row_used[r] += 1
+            if not ok:
+                break
+
+        # Validate: rows are 5 each, and column sums match counts
+        if ok and row_used == [5, 5, 5] and all(sum(rows[r][ci] for r in range(3)) == counts[ci] for ci in range(9)):
+            break
+    else:
+        # Extremely rare fallback: evenly distribute per old approach
+        # (kept for robustness; you can remove this if you prefer a hard failure)
+        return _fallback_generate_ticket(cols)
+
+    # --- Fill numbers into the chosen cells; ascending within each column top→bottom ---
+    ticket = [[0]*9 for _ in range(3)]
+    for ci in range(9):
+        k = counts[ci]
+        nums = sorted([cols[ci].pop() for _ in range(k)])
+        r_idxs = [r for r in range(3) if rows[r][ci] == 1]
+        r_idxs.sort()  # top to bottom
+        for idx, r in enumerate(r_idxs):
+            ticket[r][ci] = nums[idx]
+
+    return ticket
+
+
+def _fallback_generate_ticket(cols):
+    """Very close to your original logic; used only if balancing fails (rare)."""
     counts = [1]*9
-    extras = 15 - sum(counts)  # 6 to distribute
+    extras = 6
     while extras > 0:
         i = random.randrange(9)
         if counts[i] < 3:
@@ -497,38 +608,31 @@ def generate_ticket_strict():
             extras -= 1
 
     rows = [[0]*9 for _ in range(3)]
-    row_used = [0,0,0]
+    row_used = [0, 0, 0]
 
-    # place columns with 3
     for ci, cnt in enumerate(counts):
         if cnt == 3:
             for r in range(3):
                 rows[r][ci] = 1
                 row_used[r] += 1
 
-    # columns with 2
     for ci, cnt in enumerate(counts):
         if cnt == 2:
-            options = sorted(range(3), key=lambda r: (row_used[r], random.random()))
-            placed = 0
-            for r in options:
+            for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
                 if row_used[r] < 5:
                     rows[r][ci] = 1
                     row_used[r] += 1
-                    placed += 1
-                    if placed == 2: break
+                    if sum(rows[rr][ci] for rr in range(3)) == 2:
+                        break
 
-    # columns with 1
     for ci, cnt in enumerate(counts):
         if cnt == 1:
-            options = sorted(range(3), key=lambda r: (row_used[r], random.random()))
-            for r in options:
+            for r in sorted(range(3), key=lambda r: (row_used[r], random.random())):
                 if row_used[r] < 5:
                     rows[r][ci] = 1
                     row_used[r] += 1
                     break
 
-    # patch any short row
     for r in range(3):
         while row_used[r] < 5:
             cands = [ci for ci in range(9) if rows[r][ci] == 0 and sum(rows[rr][ci] for rr in range(3)) < 3]
@@ -540,9 +644,9 @@ def generate_ticket_strict():
 
     ticket = [[0]*9 for _ in range(3)]
     for ci in range(9):
-        r_idxs = [r for r in range(3) if rows[r][ci] == 1]
-        need = len(r_idxs)
+        need = sum(rows[r][ci] for r in range(3))
         nums = sorted([cols[ci].pop() for _ in range(need)])
+        r_idxs = [r for r in range(3) if rows[r][ci] == 1]
         r_idxs.sort()
         for k, r in enumerate(r_idxs):
             ticket[r][ci] = nums[k]
@@ -551,6 +655,7 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
