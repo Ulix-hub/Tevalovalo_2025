@@ -176,7 +176,7 @@ def whoami():
 
 @app.get("/")
 def home():
-    return "Access Code Validator & Housie90 API (Device-Bound) ðŸš€"
+    return "Access Code Validator & Housie90 API (Device-Bound) 🚀"
 
 # ---- Helpers ----
 def _auth_ok(req):
@@ -549,7 +549,7 @@ def api_tickets():
     return jsonify({"cards": all_tickets})
 
 def generate_ticket_strict():
-    # 9 columns: 1â€“9, 10â€“19, â€¦, 80â€“90
+    # 9 columns: 1–9, 10–19, …, 80–90
     cols = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
@@ -680,6 +680,7 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
