@@ -3,6 +3,8 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import sqlite3, os, re, csv, random, secrets, io, traceback
 from threading import Lock
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -31,6 +33,7 @@ CSV_FILE = os.environ.get("CODES_CSV", "codes.csv")
 MAX_DEVICES_DEFAULT = int(os.environ.get("MAX_DEVICES_DEFAULT", "1"))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 MASTER_CODE = os.environ.get("MASTER_CODE", "").strip()
+TICKET_API_URL = os.environ.get("TICKET_API_URL", "https://tevalovalo-housie90-backend.onrender.com/api/tickets")
 lock = Lock()
 
 # ===== Secure code alphabet + helpers (Base32 w/out 0/1/I/O) =====
@@ -119,6 +122,11 @@ def init_db():
             c.execute("SELECT MaxDevices FROM codes LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE codes ADD COLUMN MaxDevices INTEGER DEFAULT 1")
+        try:
+            c.execute("SELECT AuthToken FROM activations LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE activations ADD COLUMN AuthToken TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS activation_token ON activations(AuthToken)")
         conn.commit()
 
         # Seed/refresh from CSV (UPSERT), storing canonical Code
@@ -143,12 +151,14 @@ def init_db():
                     c.execute("""
                         INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                         VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(Code) DO UPDATE SET
-                          Used       = excluded.Used,
-                          BuyerName  = excluded.BuyerName,
-                          Expiry     = excluded.Expiry,
-                          MaxDevices = excluded.MaxDevices
+                        ON CONFLICT(Code) DO NOTHING
                     """, (code, used, buyer, expiry, maxdev))
+            conn.commit()
+
+        # The configured code follows the same single-device policy.
+        if MASTER_CODE:
+            c.execute("INSERT OR IGNORE INTO codes (Code, Used, Expiry, MaxDevices) VALUES (?, 'No', ?, 1)",
+                      (to_canonical(MASTER_CODE), (datetime.utcnow() + timedelta(days=3650)).isoformat() + "Z"))
             conn.commit()
 
 init_db()
@@ -159,14 +169,14 @@ def whoami():
     return jsonify({
         "service": os.environ.get("RENDER_SERVICE_NAME", "local"),
         "env": os.environ.get("RENDER_EXTERNAL_URL", "n/a"),
-        "version": "v7-canonical-upsert",
+        "version": "v8-single-device-sessions",
         "time": datetime.utcnow().isoformat() + "Z",
         "db_file": DB_FILE
     })
 
 @app.get("/")
 def home():
-    return "Access Code Validator & Housie90 API (Device-Bound) 🚀"
+    return "Access Code Validator & Housie90 API (Device-Bound) ðŸš€"
 
 # ---- Helpers ----
 def _auth_ok(req):
@@ -201,19 +211,12 @@ def validate():
         if not device_id:
             return jsonify({"valid": False, "reason": "missing_device_id"}), 400
 
-        # Master code (binds to device; long expiry)
-        if MASTER_CODE and code == to_canonical(MASTER_CODE):
-            return jsonify({
-                "valid": True,
-                "token": f"master-{device_id}",
-                "expires_at": (datetime.utcnow()+timedelta(days=3650)).isoformat()+"Z",
-                "device_registered": True,
-                "reason": "master"
-            }), 200
-
         with lock, sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
+
+            # Serialize the check and registration across Gunicorn processes.
+            c.execute("BEGIN IMMEDIATE")
 
             # Exact canonical match
             row = c.execute("""
@@ -236,13 +239,22 @@ def validate():
             if expiry <= datetime.utcnow():
                 return jsonify({"valid": False, "reason": "expired"}), 400
 
+            # Retain only the original device if an old multi-device record exists.
+            first_device = c.execute("SELECT DeviceID FROM activations WHERE Code=? ORDER BY FirstSeen, rowid LIMIT 1",
+                                     (row["Code"],)).fetchone()
+            if first_device and first_device["DeviceID"] != device_id:
+                return jsonify({"valid": False, "reason": "device_limit"}), 403
+
             # Already activated on this device?
-            already = c.execute("SELECT 1 FROM activations WHERE Code=? AND DeviceID=?",
+            already = c.execute("SELECT AuthToken FROM activations WHERE Code=? AND DeviceID=?",
                                 (row["Code"], device_id)).fetchone()
             if already:
+                token = already["AuthToken"] or secrets.token_urlsafe(32)
+                c.execute("UPDATE activations SET AuthToken=? WHERE Code=? AND DeviceID=?", (token, row["Code"], device_id))
+                conn.commit()
                 return jsonify({
                     "valid": True,
-                    "token": f"lic-{row['Code']}-{device_id}",
+                    "token": token,
                     "expires_at": expiry.isoformat()+"Z",
                     "device_registered": True,
                     "reason": "ok_same_device"
@@ -250,13 +262,16 @@ def validate():
 
             # Device limit
             cnt = c.execute("SELECT COUNT(*) FROM activations WHERE Code=?", (row["Code"],)).fetchone()[0]
-            max_devices = _get_max_devices(row)
-            if cnt >= max_devices:
+            if cnt >= 1:
                 return jsonify({"valid": False, "reason": "device_limit"}), 403
+            # A used legacy code without its binding must not become reusable.
+            if str(row["Used"] or "No").strip().lower() == "yes":
+                return jsonify({"valid": False, "reason": "already_used"}), 403
 
             # Register device + mark used
-            c.execute("INSERT OR IGNORE INTO activations (Code, DeviceID, FirstSeen) VALUES (?, ?, ?)",
-                      (row["Code"], device_id, datetime.utcnow().isoformat()+"Z"))
+            token = secrets.token_urlsafe(32)
+            c.execute("INSERT INTO activations (Code, DeviceID, FirstSeen, AuthToken) VALUES (?, ?, ?, ?)",
+                      (row["Code"], device_id, datetime.utcnow().isoformat()+"Z", token))
             if str(row["Used"] or "No").strip().lower() != "yes":
                 c.execute("UPDATE codes SET Used='Yes', BuyerName=COALESCE(?, BuyerName) WHERE Code=?",
                           (buyer, row["Code"]))
@@ -264,7 +279,7 @@ def validate():
 
             return jsonify({
                 "valid": True,
-                "token": f"lic-{row['Code']}-{device_id}",
+                "token": token,
                 "expires_at": expiry.isoformat()+"Z",
                 "device_registered": True,
                 "reason": "ok_new_device"
@@ -273,6 +288,56 @@ def validate():
     except Exception:
         traceback.print_exc()
         return jsonify({"valid": False, "reason": "server_error"}), 500
+
+# ---- Device sessions ----
+def session_status():
+    header = request.headers.get("Authorization", "")
+    token = header[7:] if header.startswith("Bearer ") else ""
+    device_id = request.headers.get("X-Device-Id", "").strip()
+    if not token or not device_id:
+        return None, "unauthorized"
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            SELECT a.Code, c.Expiry FROM activations a JOIN codes c ON c.Code=a.Code
+            WHERE a.AuthToken=? AND a.DeviceID=?
+              AND a.DeviceID=(SELECT DeviceID FROM activations WHERE Code=a.Code ORDER BY FirstSeen, rowid LIMIT 1)
+        """, (token, device_id)).fetchone()
+    if not row:
+        return None, "unauthorized"
+    try:
+        expiry = datetime.fromisoformat((row["Expiry"] or "").replace("Z", ""))
+        if expiry <= datetime.utcnow():
+            return None, "expired"
+    except (ValueError, TypeError):
+        return None, "expired"
+    return row, None
+
+@app.get("/session")
+def check_session():
+    row, reason = session_status()
+    if reason:
+        return jsonify({"valid": False, "reason": reason}), 401
+    return jsonify({"valid": True, "expires_at": row["Expiry"]})
+
+@app.get("/licensed/tickets")
+def licensed_tickets():
+    row, reason = session_status()
+    if reason:
+        return jsonify({"valid": False, "reason": reason}), 401
+    try:
+        count = max(1, min(int(request.args.get("cards", 1)), 60))
+    except ValueError:
+        return jsonify({"error": "invalid_cards"}), 400
+    # Preserve the existing generator and Lucky Mode behind session validation.
+    url = TICKET_API_URL + "?cards=" + str(count)
+    if request.args.get("lucky") == "true":
+        url += "&lucky=true"
+    try:
+        with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=20) as upstream:
+            return Response(upstream.read(), content_type="application/json")
+    except (URLError, HTTPError, TimeoutError):
+        return jsonify({"error": "ticket_service_unavailable"}), 502
 
 # ---- ADMIN endpoints ----
 @app.post("/admin/add_code")
@@ -291,7 +356,7 @@ def admin_add_code():
             INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
             VALUES (?, 'No', ?, ?, ?)
             ON CONFLICT(Code) DO UPDATE SET
-                Used='No', BuyerName=excluded.BuyerName,
+                BuyerName=excluded.BuyerName,
                 Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
         """, (code, buyer, expiry, max_devices))
         conn.commit()
@@ -355,7 +420,7 @@ def admin_bulk_add():
                     INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                     VALUES (?, 'No', ?, ?, ?)
                     ON CONFLICT(Code) DO UPDATE SET
-                        Used='No', BuyerName=excluded.BuyerName,
+                        BuyerName=excluded.BuyerName,
                         Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
                 """, (code, buyer, expiry, max_devices))
                 added.append(code)
@@ -403,7 +468,7 @@ def admin_new_codes_secure():
                 INSERT INTO codes (Code, Used, BuyerName, Expiry, MaxDevices)
                 VALUES (?, 'No', ?, ?, ?)
                 ON CONFLICT(Code) DO UPDATE SET
-                    Used='No', BuyerName=excluded.BuyerName,
+                    BuyerName=excluded.BuyerName,
                     Expiry=excluded.Expiry, MaxDevices=excluded.MaxDevices
             """, (canonical, buyer, expiry, max_devices))
             made.append({"display": display, "canonical": canonical})
@@ -469,6 +534,9 @@ def admin_export_csv():
 # ---- Tickets (strict) ----
 @app.get("/api/tickets")
 def api_tickets():
+    row, reason = session_status()
+    if reason:
+        return jsonify({"valid": False, "reason": reason}), 401
     try:
         count = int(request.args.get("cards", 1))
     except Exception:
@@ -481,7 +549,7 @@ def api_tickets():
     return jsonify({"cards": all_tickets})
 
 def generate_ticket_strict():
-    # 9 columns: 1–9, 10–19, …, 80–90
+    # 9 columns: 1â€“9, 10â€“19, â€¦, 80â€“90
     cols = [
         list(range(1,10)), list(range(10,20)), list(range(20,30)),
         list(range(30,40)), list(range(40,50)), list(range(50,60)),
@@ -612,7 +680,6 @@ def generate_ticket_strict():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
 
 
 
